@@ -8,14 +8,11 @@ your Mac. Clipboard and file transfer work between both machines.
 
 Status: public beta (0.1.0-beta.1)
 
-<p align="center">
-  <a href="https://agentic-engineering-agency.github.io/diarchy/"><img src="docs/media/diarchy-launch-loop.webp" width="720" alt="Diarchy launch film: a Mac mouse crossing to an Omarchy desktop"></a>
-</p>
+https://github.com/user-attachments/assets/13ec6116-87d8-4d8c-829c-4990e3447503
 
-<p align="center"><a href="https://agentic-engineering-agency.github.io/diarchy/"><b>Watch the 90-second film</b></a></p>
-
-The film has English narration and captions on screen. The narration is an AI voice. It shows what Diarchy does and what
-we measured on one pair of test machines.
+The film is 90 seconds, with English narration and captions on screen. The narration is an AI voice. It shows what
+Diarchy does and what we measured on one pair of test machines. This player uses a small copy (9 MB). Watch the
+[full-quality version](https://agentic-engineering-agency.github.io/diarchy/) (24 MB) on the film page.
 
 ## What it does
 
