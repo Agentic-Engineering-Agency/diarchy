@@ -1,6 +1,6 @@
-# Diarchy
+<h1 align="center"><img src="docs/media/diarchy-icon.png" width="72" height="72" align="absmiddle" alt="Diarchy icon"> Diarchy</h1>
 
-Run your Omarchy box from your Mac.
+<p align="center"><b>Run your Omarchy box from your Mac.</b></p>
 
 Diarchy is a menu-bar app for Apple Silicon Macs. It controls an Omarchy machine (Arch Linux with Hyprland) over SSH.
 You pick one mode from the menu bar: share your Mac keyboard and mouse with the host, or stream the host screen to
@@ -8,10 +8,14 @@ your Mac. Clipboard and file transfer work between both machines.
 
 Status: public beta (0.1.0-beta.1)
 
-[![Diarchy launch film: a Mac mouse crossing to an Omarchy desktop](docs/media/diarchy-launch-loop.webp)](docs/media/diarchy-launch.mp4)
+<p align="center">
+  <a href="https://agentic-engineering-agency.github.io/diarchy/"><img src="docs/media/diarchy-launch-loop.webp" width="720" alt="Diarchy launch film: a Mac mouse crossing to an Omarchy desktop"></a>
+</p>
 
-[Watch the 90-second film](docs/media/diarchy-launch.mp4) (English narration, captions on screen). The narration is an
-AI voice. The film shows what Diarchy does and what we measured on one pair of test machines.
+<p align="center"><a href="https://agentic-engineering-agency.github.io/diarchy/"><b>Watch the 90-second film</b></a></p>
+
+The film has English narration and captions on screen. The narration is an AI voice. It shows what Diarchy does and what
+we measured on one pair of test machines.
 
 ## What it does
 

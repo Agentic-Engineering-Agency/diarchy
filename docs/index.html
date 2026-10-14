@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diarchy: launch film</title>
+<meta name="description" content="Run your Omarchy box from your Mac. A 90-second film about Diarchy, the open-source menu-bar app for Apple Silicon Macs.">
+<meta property="og:title" content="Diarchy: launch film">
+<meta property="og:description" content="Run your Omarchy box from your Mac.">
+<meta property="og:image" content="media/diarchy-launch-poster.jpg">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; gap: 1.5rem;
+         padding: 2.5rem 1rem; background: #070914; color: #e8ebf5;
+         font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  header { display: flex; align-items: center; gap: 1rem; }
+  header img { width: 64px; height: 64px; border-radius: 14px; }
+  h1 { margin: 0; font-size: 2rem; letter-spacing: -0.01em; }
+  p { margin: 0; color: #aab1c8; }
+  video { width: min(100%, 1100px); aspect-ratio: 16 / 9; background: #000; border-radius: 12px;
+          border: 1px solid #1d2240; }
+  nav { display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: center; }
+  nav a { padding: 0.5rem 1rem; border: 1px solid #2a3160; border-radius: 999px; color: #e8ebf5; text-decoration: none; }
+  nav a:hover { background: #151a3a; }
+  small { max-width: 60ch; text-align: center; color: #7f87a3; }
+</style>
+</head>
+<body>
+<header>
+  <img src="media/diarchy-icon.png" alt="Diarchy icon" width="64" height="64">
+  <div>
+    <h1>Diarchy</h1>
+    <p>Run your Omarchy box from your Mac.</p>
+  </div>
+</header>
+<video controls preload="metadata" playsinline poster="media/diarchy-launch-poster.jpg">
+  <source src="media/diarchy-launch.mp4" type="video/mp4">
+  Your browser cannot play this video. <a href="media/diarchy-launch.mp4">Download the film (MP4).</a>
+</video>
+<nav>
+  <a href="https://github.com/Agentic-Engineering-Agency/diarchy">Source on GitHub</a>
+  <a href="https://github.com/Agentic-Engineering-Agency/diarchy/releases/tag/v0.1.0-beta.1">Download the beta</a>
+  <a href="https://github.com/Agentic-Engineering-Agency/diarchy/blob/main/docs/install.md">Install guide</a>
+</nav>
+<small>90 seconds, English narration with captions on screen. The narration is an AI voice. The numbers come from one pair of
+test machines. Diarchy is not affiliated with Lan Mouse, Sunshine, Moonlight, Tailscale, Omarchy, Hyprland or Apple.</small>
+</body>
+</html>
