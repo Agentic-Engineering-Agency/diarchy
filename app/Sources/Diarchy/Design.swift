@@ -3,7 +3,8 @@ import SwiftUI
 
 // Shared look of the app. Everything here uses system controls, materials, SF Symbols and semantic colors, so light
 // and dark mode, accent color and accessibility settings come from the system. Liquid Glass is used on macOS 26 and
-// later only, always with a plain-material fallback for macOS 14 and 15 (the deployment target).
+// later only, always with a plain-material fallback for macOS 14 and 15 (the deployment target). The glass APIs exist
+// only in the macOS 26 SDK (Swift 6.2, Xcode 26), so `#if compiler(>=6.2)` keeps the app buildable with Xcode 16.
 
 // MARK: Buttons
 
@@ -11,21 +12,29 @@ extension View {
     /// The one main action of a group (`Save`, `Run Diagnostics`).
     @ViewBuilder
     func primaryActionStyle() -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             buttonStyle(.glassProminent)
         } else {
             buttonStyle(.borderedProminent)
         }
+        #else
+        buttonStyle(.borderedProminent)
+        #endif
     }
 
     /// Every other button in a group.
     @ViewBuilder
     func secondaryActionStyle() -> some View {
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             buttonStyle(.glass)
         } else {
             buttonStyle(.bordered)
         }
+        #else
+        buttonStyle(.bordered)
+        #endif
     }
 }
 
@@ -42,11 +51,15 @@ private struct SelectionSurface<S: Shape>: ViewModifier {
     func body(content: Content) -> some View {
         let accent = Color.accentColor.opacity(enabled ? 1 : 0.6)
         if selected {
+            #if compiler(>=6.2)
             if #available(macOS 26, *) {
                 content.glassEffect(.regular.tint(accent), in: shape)
             } else {
                 content.background(shape.fill(accent))
             }
+            #else
+            content.background(shape.fill(accent))
+            #endif
         } else if idleFill {
             content.background(shape.fill(.quaternary))
         } else {

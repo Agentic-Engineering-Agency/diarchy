@@ -23,7 +23,12 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_*.py'
 
   swift:
-    runs-on: macos-15
+    # macos-15 builds with the Xcode 16 SDK (the plain fallback UI), macos-26 with the Xcode 26 SDK (Liquid Glass).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
