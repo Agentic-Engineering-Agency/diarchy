@@ -8,6 +8,11 @@ your Mac. Clipboard and file transfer work between both machines.
 
 Status: public beta (0.1.0-beta.1)
 
+[![Diarchy launch film: a Mac mouse crossing to an Omarchy desktop](docs/media/diarchy-launch-loop.webp)](docs/media/diarchy-launch.mp4)
+
+[Watch the 90-second film](docs/media/diarchy-launch.mp4) (English narration, captions on screen). The narration is an
+AI voice. The film shows what Diarchy does and what we measured on one pair of test machines.
+
 ## What it does
 
 - **Off, KVM or Streaming.** One switch in the menu bar.
