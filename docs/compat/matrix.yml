@@ -1,0 +1,30 @@
+# Diarchy compatibility matrix. One record per tested pair (one host and one Mac).
+# Field help: docs/compat/README.md
+# result values: ok | partial | broken | untested | na
+# evidence: M (maintainer verified) | C1 (one community report) | C2+ (two or more independent reports) | none
+# A result of "ok" needs a non-empty "report" link, unless evidence is M.
+- id: cyborg15-mseries-2026-10
+  host:
+    model: "MSI Cyborg 15"
+    arch: x86_64
+    gpu_class: hybrid-intel-nvidia
+    gpus: "Intel iGPU + NVIDIA dGPU"
+    os: Omarchy
+  mac:
+    model: "MacBook Pro, M-series"
+    macos: "14 or later"
+  versions:
+    app: "0.1.0-beta.1"
+    moonlight: "6.1.0"
+    lan_mouse: "0.11.0"
+    sunshine: "2026.516.143833"
+  results:
+    kvm: ok
+    clipboard_files: ok
+    streaming: ok
+    headless: ok
+    lid_closed: ok
+    tailscale: untested
+  evidence: M
+  report: ""
+  tested: "2026-10"

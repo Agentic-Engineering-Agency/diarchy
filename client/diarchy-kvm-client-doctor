@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION=0.11.0
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+CONFIG_SH=${DIARCHY_CONFIG_SH:-$script_dir/diarchy-config.sh}
+PORT=4242
+LAN_MOUSE_APP=${LAN_MOUSE_APP:-$HOME/Applications/Lan Mouse.app}
+BIN="$LAN_MOUSE_APP/Contents/MacOS/lan-mouse"
+CONFIG=${LAN_MOUSE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/config.toml}
+CERT=${LAN_MOUSE_CERT:-${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/lan-mouse.pem}
+CODESIGN_BIN=${CODESIGN_BIN:-/usr/bin/codesign}
+ACCESSIBILITY_CHECK_BIN=${ACCESSIBILITY_CHECK_BIN:-$HOME/.local/bin/diarchy-kvm-accessibility-check}
+LSOF_BIN=${LSOF_BIN:-/usr/sbin/lsof}
+PGREP_BIN=${PGREP_BIN:-/usr/bin/pgrep}
+OPENSSL_BIN=${OPENSSL_BIN:-/usr/bin/openssl}
+STAT_BIN=${STAT_BIN:-/usr/bin/stat}
+SLEEP_BIN=${SLEEP_BIN:-/bin/sleep}
+
+fail() {
+  printf '[fail] %s\n' "$*" >&2
+  exit 1
+}
+
+ok() {
+  printf '[ok] %s\n' "$*"
+}
+
+if [[ ! -r $CONFIG_SH ]]; then
+  fail "cannot read config library: $CONFIG_SH"
+fi
+# shellcheck source=diarchy-config.sh
+source "$CONFIG_SH"
+# Probe in a subshell first so a failure reports the loader's reason; the real load
+# then runs in this shell to export the DIARCHY_* values.
+if ! load_reason=$(diarchy_config_load 2>&1 >/dev/null); then
+  fail "${load_reason#diarchy-config: }"
+fi
+diarchy_config_load
+side=$DIARCHY_KVM_SIDE
+LAN_HOST=$DIARCHY_LAN_HOST
+TAILSCALE_HOST=$DIARCHY_TAILSCALE_HOST
+# Same rendering as diarchy-kvm-configure: configured hosts only, LAN first.
+expected_ips=
+for host in "$LAN_HOST" "$TAILSCALE_HOST"; do
+  [[ -n $host ]] || continue
+  expected_ips=${expected_ips:+$expected_ips, }\"$host\"
+done
+# Lan Mouse stores fingerprints lowercase; diarchy.conf holds them uppercase.
+expected_fingerprint=$(printf '%s' "${DIARCHY_HOST_FINGERPRINT:-}" | tr '[:upper:]' '[:lower:]')
+
+[[ -x $BIN ]] || fail "Lan Mouse executable is missing"
+version=$("$BIN" --version 2>&1) || fail "Lan Mouse cannot report its version"
+[[ $version == *"lan-mouse $VERSION"* ]] || fail "expected lan-mouse $VERSION"
+"$CODESIGN_BIN" --verify --deep --strict "$LAN_MOUSE_APP" \
+  || fail "Lan Mouse code signature is invalid"
+ok "Lan Mouse $VERSION identity and signature"
+
+[[ -x $ACCESSIBILITY_CHECK_BIN ]] || fail "Accessibility checker is missing"
+"$ACCESSIBILITY_CHECK_BIN" >/dev/null \
+  || fail "Lan Mouse lacks macOS Accessibility permission"
+ok "macOS Accessibility permission"
+
+[[ -f $CONFIG ]] || fail "configuration is missing"
+mode=$($STAT_BIN -f '%Lp' "$CONFIG")
+[[ $mode == 600 ]] || fail "configuration mode is $mode, expected 600"
+grep -q '^\[authorized_fingerprints\]$' "$CONFIG" \
+  || fail "authorized_fingerprints section is missing"
+[[ -n $expected_fingerprint ]] \
+  && grep -Fiq -- "\"$expected_fingerprint\" = \"host\"" "$CONFIG" \
+  || fail "trusted host fingerprint is missing"
+grep -Fqx "position = \"$side\"" "$CONFIG" || fail "host is not positioned $side"
+grep -q '^activate_on_startup = true$' "$CONFIG" || fail "host client is inactive"
+grep -Fqx "ips = [$expected_ips]" "$CONFIG" \
+  || fail "host addresses are not pinned"
+ok "trusted $side-edge client configuration"
+
+[[ -f $CERT ]] || fail "Lan Mouse certificate is missing"
+fingerprint=$($OPENSSL_BIN x509 -in "$CERT" -noout -fingerprint -sha256 2>/dev/null) \
+  || fail "Lan Mouse certificate is invalid"
+[[ $fingerprint == *"Fingerprint="* ]] || fail "certificate fingerprint is unavailable"
+ok "Lan Mouse certificate"
+
+route=none
+# pgrep reads the pattern as an extended regular expression; a home path can hold `+`, `(` or `[`.
+bin_pattern=$(printf '%s' "$BIN" | /usr/bin/sed -E 's/[][\\.*+?(){}|^$]/\\&/g')
+for _ in {1..25}; do
+  pids=$(
+    "$PGREP_BIN" -f -x "$bin_pattern" 2>/dev/null || true
+    "$PGREP_BIN" -f -x "$bin_pattern daemon" 2>/dev/null || true
+  )
+  [[ -n $pids ]] || fail "Lan Mouse is not enabled"
+  pid_csv=${pids//$'\n'/,}
+  sockets=$("$LSOF_BIN" -nP -a -p "$pid_csv" -iUDP 2>/dev/null || true)
+
+  if [[ -n $LAN_HOST ]] && grep -Fq -- "->${LAN_HOST}:${PORT}" <<<"$sockets"; then
+    route=lan
+    break
+  elif [[ -n $TAILSCALE_HOST ]] && grep -Fq -- "->${TAILSCALE_HOST}:${PORT}" <<<"$sockets"; then
+    route=tailscale
+    break
+  elif grep -Eq "UDP .*:${PORT}([[:space:]]|$)" <<<"$sockets"; then
+    route=idle
+    break
+  fi
+  "$SLEEP_BIN" 0.2
+done
+[[ $route != none ]] || fail "Lan Mouse has no connected host peer on UDP $PORT; cross the $side edge once, then retry"
+printf '[ok] active-route=%s udp=%s\n' "$route" "$PORT"
+ok "Lan Mouse process is enabled"
+printf '[ok] Diarchy KVM client is healthy\n'

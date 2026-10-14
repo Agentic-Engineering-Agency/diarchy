@@ -1,0 +1,14 @@
+[Unit]
+Description=Diarchy edge file portal
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/diarchy-file-portal
+Restart=on-failure
+NoNewPrivileges=yes
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

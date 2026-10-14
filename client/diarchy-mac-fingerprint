@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# diarchy-mac-fingerprint
+# Print the SHA-256 fingerprint (uppercase, colon-separated) of this Mac's Lan Mouse certificate.
+set -euo pipefail
+
+CERT=${LAN_MOUSE_CERT:-${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/lan-mouse.pem}
+OPENSSL_BIN=${OPENSSL_BIN:-/usr/bin/openssl}
+
+fail() {
+  printf 'diarchy-mac-fingerprint: %s\n' "$1" >&2
+  exit 1
+}
+
+[[ -f $CERT ]] || fail 'Lan Mouse certificate not found; start Lan Mouse once'
+
+output=$("$OPENSSL_BIN" x509 -in "$CERT" -noout -fingerprint -sha256 2>/dev/null) \
+  || fail 'Lan Mouse certificate is invalid'
+
+first_line=${output%%$'\n'*}
+[[ $first_line == *=* ]] || fail 'Lan Mouse certificate is invalid'
+fingerprint=$(printf '%s' "${first_line#*=}" | tr '[:lower:]' '[:upper:]')
+
+fingerprint_re='^([0-9A-F]{2}:){31}[0-9A-F]{2}$'
+[[ $fingerprint =~ $fingerprint_re ]] || fail 'Lan Mouse certificate is invalid'
+
+printf '%s\n' "$fingerprint"

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+MOONLIGHT_APP=${MOONLIGHT_APP:-"$HOME/Applications/Moonlight.app"}
+LAUNCHER_APP=${DIARCHY_APP:-"$HOME/Applications/Diarchy.app"}
+LAUNCHER_BIN=${DIARCHY_STREAM_BIN:-"$HOME/.local/bin/diarchy-stream"}
+CODESIGN_BIN=${CODESIGN_BIN:-/usr/bin/codesign}
+SPCTL_BIN=${SPCTL_BIN:-/usr/sbin/spctl}
+PLIST_BUDDY_BIN=${PLIST_BUDDY_BIN:-/usr/libexec/PlistBuddy}
+EXPECTED_MOONLIGHT_ID=com.moonlight-stream.Moonlight
+EXPECTED_LAUNCHER_ID=dev.sebastiangmz.diarchy
+failures=0
+
+check() {
+  local label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '[ok] %s\n' "$label"
+  else
+    printf '[fail] %s\n' "$label" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+check_bundle_id() {
+  local app=$1 expected=$2
+  [[ -d "$app" ]] || return 1
+  [[ "$("$PLIST_BUDDY_BIN" -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null)" == "$expected" ]]
+}
+
+check "Moonlight executable" test -x "$MOONLIGHT_APP/Contents/MacOS/Moonlight"
+check "Moonlight bundle identity" check_bundle_id "$MOONLIGHT_APP" "$EXPECTED_MOONLIGHT_ID"
+check "Moonlight signature" "$CODESIGN_BIN" --verify --deep --strict "$MOONLIGHT_APP"
+check "Moonlight Gatekeeper" "$SPCTL_BIN" --assess --type execute "$MOONLIGHT_APP"
+check "Diarchy launcher" check_bundle_id "$LAUNCHER_APP" "$EXPECTED_LAUNCHER_ID"
+check "Streaming launcher script" test -x "$LAUNCHER_BIN"
+CONFIG_LIB=${DIARCHY_CONFIG_SH:-"$(dirname "$LAUNCHER_BIN")/diarchy-config.sh"}
+if [[ -r $CONFIG_LIB ]] && ( source "$CONFIG_LIB" && diarchy_config_load ) >/dev/null 2>&1; then
+  printf '[ok] Diarchy configuration loads\n'
+else
+  printf '[fail] Diarchy configuration loads\n' >&2
+  failures=$((failures + 1))
+fi
+
+if [[ -x "$LAUNCHER_BIN" ]]; then
+  if "$LAUNCHER_BIN" --diagnose; then
+    printf '[ok] At least one host route is reachable\n'
+  else
+    printf '[fail] host is unreachable on LAN and Tailscale\n' >&2
+    failures=$((failures + 1))
+  fi
+fi
+
+if (( failures > 0 )); then
+  printf '%d client check(s) failed\n' "$failures" >&2
+  exit 1
+fi
+printf 'Client checks passed\n'

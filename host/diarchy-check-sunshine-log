@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+if [[ $# -ne 1 || -z $1 ]]; then
+  printf 'usage: %s OUTPUT\n' "$0" >&2
+  exit 64
+fi
+
+selected_output=$1
+logs=$(cat)
+
+fail() {
+  printf '[fail] %s\n' "$1" >&2
+  exit 1
+}
+
+require_fixed() {
+  local marker=$1
+  local label=$2
+  grep -Fq -- "$marker" <<<"$logs" || fail "$label"
+}
+
+require_regex() {
+  local marker=$1
+  local label=$2
+  grep -Eq -- "$marker" <<<"$logs" || fail "$label"
+}
+
+reject_fixed() {
+  local marker=$1
+  local label=$2
+  if grep -Fq -- "$marker" <<<"$logs"; then
+    fail "$label"
+  fi
+}
+
+# Every `[wlgrab] Selected monitor` line must name the selected output: the first one is the startup probe, each
+# later one is a client session. Sunshine resolves `output_name` again for each session (video.cpp refresh_displays),
+# so a startup line alone does not prove what a client sees.
+require_selection() {
+  local pattern=$1 label=$2 selections line
+  selections=$(grep -E -- '\[wlgrab\] Selected monitor \[.*\] for streaming$' <<<"$logs")
+  [[ -n $selections ]] || fail "$label"
+  grep -Eq -- "$pattern" <<<"$(head -n 1 <<<"$selections")" || fail "$label"
+  while IFS= read -r line; do
+    grep -Eq -- "$pattern" <<<"$line" ||
+      fail "Sunshine selected a different monitor for a client session: ${line##*\] Selected monitor }"
+  done <<<"$selections"
+}
+
+require_fixed "Screencasting with Wayland's protocol" \
+  "Sunshine did not initialize Wayland screencasting"
+case "$selected_output" in
+  DIARCHY)
+    require_regex '\[wayland\] Name: DIARCHY$' \
+      "Sunshine did not enumerate the selected output: DIARCHY"
+    require_selection '\[wlgrab\] Selected monitor \[\] for streaming$' \
+      "Sunshine did not select the headless monitor"
+    ;;
+  *)
+    [[ $selected_output =~ ^[A-Za-z0-9._-]{1,64}$ ]] ||
+      fail "Unsupported selected output: $selected_output"
+    escaped_output=${selected_output//./\\.}
+    require_regex "\\[wayland\\] Name: ${escaped_output}\$" \
+      "Sunshine did not enumerate the selected output: $selected_output"
+    require_selection "\\[wlgrab\\] Selected monitor \\[[^]]*\\(${escaped_output}\\)\\] for streaming\$" \
+      "Sunshine selected a different physical monitor"
+    ;;
+esac
+reject_fixed "Frame capture failed" \
+  "Sunshine reported a frame capture failure"
+reject_fixed "Failed to initialize capture method" \
+  "Sunshine failed to initialize its capture method"
+encoder_family() {
+  sed -nE "s/.*Found $1 encoder: [^ ]+ \\[([a-z0-9]+)\\][[:space:]]*\$/\\1/p" <<<"$logs" | head -n 1
+}
+
+h264_family=$(encoder_family 'H\.264')
+hevc_family=$(encoder_family 'HEVC')
+[[ -n $h264_family ]] || fail "Sunshine did not report an H.264 encoder"
+case "$h264_family" in
+  nvenc|vaapi) ;;
+  *) fail "Sunshine selected a non-hardware H.264 encoder: $h264_family" ;;
+esac
+[[ -n $hevc_family ]] || fail "Sunshine did not report an HEVC encoder"
+[[ $hevc_family == "$h264_family" ]] ||
+  fail "Sunshine selected different H.264 ($h264_family) and HEVC ($hevc_family) encoders"
+printf '%s\n' "$h264_family"

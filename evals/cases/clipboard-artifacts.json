@@ -1,0 +1,16 @@
+{
+  "schema_version": "eval.case.v1",
+  "case_id": "clipboard-runtime-artifacts",
+  "title": "Clipboard runtime and tests exist",
+  "suite": "smoke",
+  "risk_tier": "critical",
+  "task_type": "repository_smoke",
+  "source": {"kind": "spec", "path": "docs/superpowers/specs/2026-07-29-clipboard-file-transfer-design.md"},
+  "privacy": {"classification": "public", "sanitized": true},
+  "expected": {"success_criteria": ["Both clipboard pumps and their deterministic test module exist."]},
+  "judge": {"type": "deterministic", "assertions": [
+    {"type": "file_exists", "path": "client/diarchy-clipboard-bridge"},
+    {"type": "file_exists", "path": "host/diarchy-clipboard-remote"},
+    {"type": "file_exists", "path": "tests/test_clipboard_bridge.py"}
+  ]}
+}

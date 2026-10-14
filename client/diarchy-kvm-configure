@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# diarchy-kvm-configure
+# Render the Lan Mouse config.toml from diarchy.conf (atomic, mode 0600).
+set -euo pipefail
+
+MARKER='# Managed by diarchy'
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+config_sh=${DIARCHY_CONFIG_SH:-$script_dir/diarchy-config.sh}
+CONFIG_FILE=${LAN_MOUSE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/config.toml}
+CONFIG_DIR=$(dirname -- "$CONFIG_FILE")
+
+fail() {
+  printf 'diarchy-kvm-configure: %s\n' "$1" >&2
+  exit 1
+}
+
+if [[ ! -r $config_sh ]]; then
+  fail "cannot read config library: $config_sh"
+fi
+# shellcheck source=diarchy-config.sh
+source "$config_sh"
+diarchy_config_load || exit 1
+
+[[ ! -d $CONFIG_FILE ]] || fail "$CONFIG_FILE is a directory"
+
+side=$DIARCHY_KVM_SIDE
+ips=
+for host in "$DIARCHY_LAN_HOST" "$DIARCHY_TAILSCALE_HOST"; do
+  [[ -n $host ]] || continue
+  ips=${ips:+$ips, }\"$host\"
+done
+fingerprint=$(printf '%s' "${DIARCHY_HOST_FINGERPRINT:-}" | tr '[:upper:]' '[:lower:]')
+
+if [[ ! -d $CONFIG_DIR ]]; then
+  (umask 077 && mkdir -p -- "$CONFIG_DIR") 2>/dev/null \
+    || fail "cannot create configuration directory: $CONFIG_DIR"
+fi
+
+config_stage=
+cleanup() {
+  if [[ -n $config_stage ]]; then
+    rm -f -- "$config_stage"
+  fi
+}
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap cleanup EXIT
+
+if [[ -f $CONFIG_FILE ]]; then
+  first_line=
+  if [[ -r $CONFIG_FILE ]]; then
+    IFS= read -r first_line <"$CONFIG_FILE" || true
+  fi
+  if [[ $first_line != "$MARKER" ]]; then
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup=$CONFIG_FILE.backup.$stamp
+    suffix=0
+    # Reserve the backup name with an exclusive create (noclobber) so same-second or
+    # concurrent runs never overwrite a backup. A failed reservation on a name that does
+    # not exist is a real error, not a collision.
+    until (umask 077 && set -C && : >"$backup") 2>/dev/null; do
+      [[ -e $backup || -L $backup ]] || fail "cannot back up existing configuration: $CONFIG_FILE"
+      suffix=$((suffix + 1))
+      ((suffix <= 1000)) || fail "cannot back up existing configuration: $CONFIG_FILE"
+      backup=$CONFIG_FILE.backup.$stamp.$suffix
+    done
+    if ! cat -- "$CONFIG_FILE" >"$backup" 2>/dev/null; then
+      rm -f -- "$backup"
+      fail "cannot back up existing configuration: $CONFIG_FILE"
+    fi
+    printf '[info] Preserved existing Lan Mouse config at %s\n' "$backup"
+  fi
+fi
+
+config_stage=$(mktemp "$CONFIG_FILE.XXXXXX" 2>/dev/null) \
+  || fail "cannot write configuration: $CONFIG_FILE"
+# Render in memory and write once: a failing write anywhere in this step must reach the
+# `|| fail` below (inside a `{ ...; } || fail` group, set -e is ignored mid-group).
+nl=$'\n'
+rendered=$MARKER$nl
+rendered+='release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]'$nl
+rendered+='port = 4242'$nl$nl
+rendered+='[authorized_fingerprints]'$nl
+if [[ -n $fingerprint ]]; then
+  rendered+="\"$fingerprint\" = \"host\"$nl"
+fi
+rendered+=$nl'[[clients]]'$nl
+rendered+="position = \"$side\"$nl"
+rendered+='hostname = "host"'$nl
+rendered+='activate_on_startup = true'$nl
+rendered+="ips = [$ips]$nl"
+rendered+='port = 4242'$nl
+chmod -- 600 "$config_stage" 2>/dev/null \
+  || fail "cannot write configuration: $CONFIG_FILE"
+printf '%s' "$rendered" >"$config_stage" 2>/dev/null \
+  || fail "cannot write configuration: $CONFIG_FILE"
+mv -- "$config_stage" "$CONFIG_FILE" 2>/dev/null \
+  || fail "cannot write configuration: $CONFIG_FILE"
+config_stage=
+
+printf '[ok] Lan Mouse configuration written (side: %s)\n' "$side"

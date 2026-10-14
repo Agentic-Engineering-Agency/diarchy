@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -uo pipefail
+PING_BIN=${PING_BIN:-ping}
+HOST_PATTERN='^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$'
+usage() { printf 'usage: %s [controller-address]\n' "${0##*/}" >&2; exit 64; }
+(( $# <= 1 )) || usage
+controller=${1-}
+if (( $# == 1 )); then
+  [[ $controller == *$'\n'* || $controller == *$'\r'* ]] && usage
+  [[ $controller =~ $HOST_PATTERN ]] || usage
+fi
+
+
+failures=0
+warnings=0
+
+pass() { printf '[ok]   %s\n' "$1"; }
+fail() { printf '[fail] %s\n' "$1" >&2; failures=$((failures + 1)); }
+warn() { printf '[warn] %s\n' "$1"; warnings=$((warnings + 1)); }
+
+check_command() {
+  local label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then pass "$label"; else fail "$label"; fi
+}
+
+info() { printf '[info] %s\n' "$1"; }
+
+DEV_ROOT=${DIARCHY_DEV_ROOT:-/dev}
+PROC_ROOT=${DIARCHY_PROC_ROOT:-/proc}
+UNIT_DIR=$HOME/.config/systemd/user
+
+# A streaming unit that is off is normal while Streaming is off; only a unit that failed is a problem.
+check_streaming_unit() {
+  local label=$1 unit=$2
+  if systemctl --user is-active --quiet "$unit" >/dev/null 2>&1; then
+    pass "$label is active"
+  elif systemctl --user is-failed --quiet "$unit" >/dev/null 2>&1; then
+    fail "$label failed. Run: journalctl --user -u $unit -n 50"
+  else
+    info "$label is inactive (Streaming is off)"
+    return 1
+  fi
+}
+
+if [[ -x $HOME/.local/bin/sunshine || -e $UNIT_DIR/diarchy-sunshine.service ]]; then
+  check_command "Sunshine binary is executable" test -x "$HOME/.local/bin/sunshine"
+  check_command "Sunshine config is private" \
+    bash -c 'test "$(stat -c %a "$HOME/.config/sunshine/sunshine.conf")" = 600'
+  check_command "uinput accepts remote input" test -w "$DEV_ROOT/uinput"
+  streaming_up=1
+  check_streaming_unit "Mirror output service" diarchy-display.service || streaming_up=0
+  check_streaming_unit "Sunshine service" diarchy-sunshine.service || streaming_up=0
+  if (( streaming_up )); then
+    if selected_output=$("$HOME/.local/bin/diarchy-check-sunshine-service") &&
+      encoder=$("$HOME/.local/bin/diarchy-check-sunshine-service" --encoder); then
+      pass "Sunshine capture and $encoder hardware encoding match $selected_output in the current invocation"
+    else
+      fail "Sunshine capture or hardware encoding does not match the current invocation. Run: journalctl --user -u diarchy-sunshine.service -n 50"
+    fi
+  else
+    info "Sunshine capture check skipped (Streaming is off)"
+  fi
+else
+  info "Streaming is not installed; Sunshine checks skipped"
+fi
+
+if compgen -G "$PROC_ROOT/acpi/button/lid/*" >/dev/null; then
+  if systemd-analyze cat-config systemd/logind.conf 2>/dev/null |
+    grep -q '^HandleLidSwitch=ignore$'; then
+    pass "Lid close does not suspend the host"
+  else
+    fail "Lid close can suspend the host. Add a logind drop-in with HandleLidSwitch=ignore"
+  fi
+else
+  info "No lid switch on this host; lid check skipped"
+fi
+
+if [[ -z $controller ]]; then
+  printf '[info] Mac LAN path probe skipped (no controller address given)\n'
+else
+  ping_output=$("$PING_BIN" -c 10 -W 1 "$controller" 2>&1 || true)
+  loss=$(printf '%s\n' "$ping_output" | sed -nE 's/.* ([0-9.]+)% packet loss.*/\1/p' | tail -1)
+  average=$(printf '%s\n' "$ping_output" | sed -nE 's#.* = [0-9.]+/([0-9.]+)/.*#\1#p' | tail -1)
+
+  if [[ -z "$loss" ]]; then
+    warn "Mac LAN path could not be measured; Tailscale may still work"
+  elif awk -v loss="$loss" 'BEGIN { exit !(loss > 2) }'; then
+    warn "Mac LAN path has ${loss}% packet loss; use the degraded profile and wire the host to Ethernet"
+  elif [[ -n "$average" ]] && awk -v ms="$average" 'BEGIN { exit !(ms > 25) }'; then
+    warn "Mac LAN path averages ${average} ms; use the degraded profile and wire the host to Ethernet"
+  else
+    pass "Mac LAN path is healthy (${loss}% loss, ${average:-unknown} ms average)"
+  fi
+fi
+
+printf '\nSummary: %d failure(s), %d warning(s)\n' "$failures" "$warnings"
+(( failures == 0 ))

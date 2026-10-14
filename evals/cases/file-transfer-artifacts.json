@@ -1,0 +1,17 @@
+{
+  "schema_version": "eval.case.v1",
+  "case_id": "file-transfer-runtime-artifacts",
+  "title": "File transfer and route artifacts exist",
+  "suite": "smoke",
+  "risk_tier": "critical",
+  "task_type": "repository_smoke",
+  "source": {"kind": "spec", "path": "docs/superpowers/specs/2026-07-29-clipboard-file-transfer-design.md"},
+  "privacy": {"classification": "public", "sanitized": true},
+  "expected": {"success_criteria": ["The route library, transfer CLI, and their deterministic tests exist."]},
+  "judge": {"type": "deterministic", "assertions": [
+    {"type": "file_exists", "path": "client/diarchy-route.sh"},
+    {"type": "file_exists", "path": "client/diarchy-file"},
+    {"type": "file_exists", "path": "tests/test_route_selection.py"},
+    {"type": "file_exists", "path": "tests/test_file_transfer.py"}
+  ]}
+}

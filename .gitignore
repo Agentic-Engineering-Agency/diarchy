@@ -1,0 +1,38 @@
+.DS_Store
+*.log
+__pycache__/
+
+# local agent tooling (never published)
+.omp
+.pi/
+.pi/.specsafe-state.json
+.pi/.specsafe-state.json.corrupt-*
+.pi/.push-log.jsonl
+.pi/.linear-log.jsonl
+.pi/.github-log.jsonl
+.pi/.docs-registry-log.jsonl
+.pi/.doc-drafts/
+.pi/.docs-cache/
+.pi/.bootstrap-log.jsonl
+.superpowers/
+.worktrees/
+
+# build output (any depth)
+.build/
+build/
+app/.build/
+app/build/
+
+# machine run logs
+evals/runs/*
+evals/reports/*
+!evals/runs/.gitkeep
+!evals/reports/.gitkeep
+
+# local overrides, secrets, owner leak list
+*.local.*
+.env
+.env.*
+*.pem
+*.key
+.personal-data-denylist

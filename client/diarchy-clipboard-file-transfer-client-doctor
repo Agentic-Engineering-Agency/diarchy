@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+BIN_DIR=${BIN_DIR:-"$HOME/.local/bin"}
+APPLICATIONS_DIR=${APPLICATIONS_DIR:-"$HOME/Applications"}
+DROP_APP=${DIARCHY_DROP_APP:-"$APPLICATIONS_DIR/Diarchy Drop.app"}
+FILE_PORTAL_APP=${DIARCHY_FILE_PORTAL_APP:-"$APPLICATIONS_DIR/Diarchy File Portal.app"}
+PLIST_BUDDY_BIN=${PLIST_BUDDY_BIN:-/usr/libexec/PlistBuddy}
+PING_BIN=${PING_BIN:-/sbin/ping}
+ROUTE_BIN=${ROUTE_BIN:-/sbin/route}
+CONNECT_BIN=${CONNECT_BIN:-/usr/bin/nc}
+SSH_BIN=${SSH_BIN:-/usr/bin/ssh}
+RSYNC_BIN=${RSYNC_BIN:-rsync}
+PBCOPY_BIN=${PBCOPY_BIN:-/usr/bin/pbcopy}
+PBPASTE_BIN=${PBPASTE_BIN:-/usr/bin/pbpaste}
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3 2>/dev/null || true)}
+DIARCHY_ROUTE_SH=${DIARCHY_ROUTE_SH:-"$BIN_DIR/diarchy-route.sh"}
+EXPECTED_DROP_ID=dev.sebastiangmz.diarchy-drop
+EXPECTED_FILE_PORTAL_ID=dev.sebastiangmz.diarchy-file-portal
+EXPECTED_ROUTE_SHA256=0f401f233fc4ab18ae154c15b57711e027f8caabdb4eebef25e38ba0f42a03a5
+failures=0
+
+ok() { printf '[ok] %s\n' "$1"; }
+fail() { printf '[fail] %s\n' "$1" >&2; failures=$((failures + 1)); }
+warn() { printf '[warn] %s\n' "$1"; }
+
+mode_of() {
+  if stat -f %Lp "$1" >/dev/null 2>&1; then
+    stat -f %Lp "$1"
+  else
+    stat -c %a "$1"
+  fi
+}
+
+sha256_file() {
+  python3 - "$1" <<'PY'
+from __future__ import annotations
+import hashlib
+import pathlib
+import sys
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
+check_executable() {
+  local path=$1 label=$2
+  if [[ -x "$path" ]] && [[ "$(mode_of "$path")" == 755 ]]; then
+    ok "$label is executable and mode 755"
+  else
+    fail "$label is missing, not executable, or wrong mode"
+  fi
+}
+
+check_dir_mode() {
+  local path=$1 label=$2
+  if [[ -d "$path" ]] && [[ "$(mode_of "$path")" == 700 ]]; then
+    ok "$label is private"
+  else
+    fail "$label is missing or wrong mode"
+  fi
+}
+
+check_command_available() {
+  local command_path=$1 label=$2
+  if [[ -x "$command_path" ]] || command -v "$command_path" >/dev/null 2>&1; then
+    ok "$label is available"
+  else
+    fail "$label was not found in the configured command path"
+  fi
+}
+
+check_python_version() {
+  if [[ -x "$PYTHON_BIN" ]] \
+    && "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+    ok "python3 is version 3.9 or newer"
+  else
+    fail "python3 3.9 or newer is unavailable"
+  fi
+}
+
+plist_value() {
+  local app=$1 key=$2
+  "$PLIST_BUDDY_BIN" -c "Print :$key" "$app/Contents/Info.plist" 2>/dev/null
+}
+
+check_bundle_id() {
+  local app=$1 expected=$2 label=$3 actual
+  if [[ ! -d "$app" ]]; then
+    fail "$label app is missing"
+    return
+  fi
+  actual=$(plist_value "$app" CFBundleIdentifier) || {
+    fail "$label bundle identity is unreadable"
+    return
+  }
+  if [[ "$actual" == "$expected" ]]; then
+    ok "$label bundle identity is $expected"
+  else
+    fail "$label bundle identity is $actual"
+  fi
+}
+
+check_file_portal_bundle() {
+  check_bundle_id "$FILE_PORTAL_APP" "$EXPECTED_FILE_PORTAL_ID" "Diarchy File Portal"
+  local lsui executable executable_path
+  lsui=$(plist_value "$FILE_PORTAL_APP" LSUIElement) || {
+    fail "Diarchy File Portal LSUIElement metadata is unreadable"
+    return
+  }
+  executable=$(plist_value "$FILE_PORTAL_APP" CFBundleExecutable) || {
+    fail "Diarchy File Portal executable metadata is unreadable"
+    return
+  }
+  if [[ "$lsui" == true && "$executable" == diarchy-file-portal ]]; then
+    ok "Diarchy File Portal metadata is LSUIElement true with executable diarchy-file-portal"
+  else
+    fail "Diarchy File Portal metadata is unexpected"
+  fi
+  executable_path="$FILE_PORTAL_APP/Contents/MacOS/$executable"
+  check_executable "$executable_path" "Diarchy File Portal executable"
+}
+
+route_digest_is_reviewed() {
+  local actual
+  [[ -r "$DIARCHY_ROUTE_SH" ]] || return 1
+  actual=$(sha256_file "$DIARCHY_ROUTE_SH") || return 1
+  [[ "$actual" == "$EXPECTED_ROUTE_SHA256" ]]
+}
+
+check_command_available "$PBCOPY_BIN" "pbcopy"
+check_command_available "$PBPASTE_BIN" "pbpaste"
+check_command_available "$SSH_BIN" "ssh"
+check_command_available "$RSYNC_BIN" "rsync"
+check_python_version
+check_executable "$BIN_DIR/diarchy-clipboard-bridge" "Clipboard bridge"
+check_executable "$BIN_DIR/diarchy-file" "File transfer command"
+check_executable "$BIN_DIR/diarchy-route.sh" "Route contract"
+check_executable "$BIN_DIR/diarchy-config.sh" "Config loader"
+check_executable "$BIN_DIR/diarchy-ssh" "SSH wrapper"
+check_executable "$BIN_DIR/diarchy-host-key" "Host key tool"
+check_executable "$BIN_DIR/diarchy-clipboard-file-transfer-client-doctor" "Client doctor"
+check_executable "$BIN_DIR/diarchy-file-portal-receiver" "File portal receiver"
+check_executable "$BIN_DIR/diarchy-file-portal-send" "File portal sender"
+check_dir_mode "$HOME/Drop/from-host" "Drop/from-host"
+check_bundle_id "$DROP_APP" "$EXPECTED_DROP_ID" "Diarchy Drop"
+check_file_portal_bundle
+
+if route_digest_is_reviewed; then
+  ok "Route contract has reviewed digest"
+  # shellcheck source=/dev/null
+  source "$DIARCHY_ROUTE_SH"
+  config_loader=${DIARCHY_CONFIG_SH:-$(dirname -- "$DIARCHY_ROUTE_SH")/diarchy-config.sh}
+  if [[ ! -r "$config_loader" ]]; then
+    fail "cannot read config loader: $config_loader"
+  else
+    # shellcheck source=/dev/null
+    source "$config_loader"
+    # Probe first so a config problem reports the loader's own reason, not a route failure.
+    if ! load_reason=$(diarchy_config_load 2>&1 >/dev/null); then
+      fail "${load_reason#diarchy-config: }"
+    elif ! diarchy_config_load 2>/dev/null || ! diarchy_host_key_pinned "$DIARCHY_HOST_KEY_ALIAS"; then
+      fail "host key not confirmed. Open Diarchy and confirm the host key."
+    elif select_diarchy_route auto >/dev/null 2>&1; then
+      ssh_options=(
+        -o BatchMode=yes
+        -o ConnectTimeout=5
+        -o PermitLocalCommand=no
+        -o ClearAllForwardings=yes
+      )
+      if "$SSH_BIN" "${ssh_options[@]}" "${diarchy_ssh_options[@]}" "$DIARCHY_SSH_ALIAS" true >/dev/null 2>&1; then
+        ok "host SSH route accepts BatchMode commands"
+      else
+        identity_option=
+        [[ -z ${DIARCHY_SSH_IDENTITY_FILE:-} ]] || identity_option=" -i $DIARCHY_SSH_IDENTITY_FILE.pub"
+        fail "host SSH route rejected BatchMode; pair manually with ssh-copy-id -p $DIARCHY_SSH_PORT$identity_option $DIARCHY_SSH_USER@$DIARCHY_ROUTE_HOST"
+      fi
+    else
+      fail "Diarchy route contract cannot select a reachable route"
+    fi
+  fi
+else
+  fail "Route contract reviewed digest does not match"
+fi
+
+
+if (( failures > 0 )); then
+  printf '%d client clipboard/file-transfer check(s) failed\n' "$failures" >&2
+  exit 1
+fi
+printf '[ok] Client clipboard/file-transfer checks passed\n'

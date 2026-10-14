@@ -1,0 +1,57 @@
+{
+  "source": "synthetic",
+  "cards": [
+    {
+      "card": "card0",
+      "pci": "0000:00:02.0",
+      "vendor": "0x8086",
+      "device": "0x7d55",
+      "driver": "i915",
+      "render": "renderD129",
+      "boot_vga": true,
+      "connectors": [
+        "eDP-1"
+      ]
+    },
+    {
+      "card": "card1",
+      "pci": "0000:01:00.0",
+      "vendor": "0x10de",
+      "device": "0x28a0",
+      "driver": "nvidia",
+      "render": "renderD128",
+      "boot_vga": false,
+      "connectors": [
+        "DP-1",
+        "HDMI-A-1"
+      ]
+    }
+  ],
+  "expect": {
+    "eDP-1": [
+      "/dev/dri/renderD129",
+      "i915",
+      "vaapi"
+    ],
+    "HDMI-A-1": [
+      "/dev/dri/renderD128",
+      "nvidia",
+      "nvenc"
+    ],
+    "DP-1": [
+      "/dev/dri/renderD128",
+      "nvidia",
+      "nvenc"
+    ],
+    "DIARCHY": [
+      "/dev/dri/renderD129",
+      "i915",
+      "vaapi"
+    ],
+    "null": [
+      "/dev/dri/renderD129",
+      "i915",
+      "vaapi"
+    ]
+  }
+}

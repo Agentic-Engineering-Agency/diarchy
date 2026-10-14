@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+DISPLAY_BIN=${DISPLAY_BIN:-$HOME/.local/bin/diarchy-display}
+SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-systemctl}
+JOURNALCTL_BIN=${JOURNALCTL_BIN:-journalctl}
+LOG_CHECKER_BIN=${LOG_CHECKER_BIN:-$HOME/.local/bin/diarchy-check-sunshine-log}
+SERVICE_NAME=diarchy-sunshine.service
+
+fail() {
+  printf '[fail] %s\n' "$1" >&2
+  exit 1
+}
+
+mode=output
+case "${1:-}" in
+  "") ;;
+  --encoder) mode=encoder ;;
+  *) printf 'usage: %s [--encoder]\n' "$0" >&2; exit 64 ;;
+esac
+(( $# <= 1 )) || { printf 'usage: %s [--encoder]\n' "$0" >&2; exit 64; }
+
+if ! selected_output=$("$DISPLAY_BIN" status); then
+  fail "No active Hyprland output is available for capture"
+fi
+[[ -n "$selected_output" ]] || fail "Hyprland selected an empty output name"
+
+if ! invocation_id=$(
+  "$SYSTEMCTL_BIN" --user show "$SERVICE_NAME" \
+    --property=InvocationID --value
+); then
+  fail "Sunshine's current systemd invocation could not be queried"
+fi
+[[ -n "$invocation_id" ]] || fail "Sunshine service has no current invocation"
+
+if ! sunshine_logs=$(
+  "$JOURNALCTL_BIN" --user _SYSTEMD_INVOCATION_ID="$invocation_id" --no-pager
+); then
+  fail "Sunshine's current invocation logs could not be read"
+fi
+
+if ! encoder=$(printf '%s\n' "$sunshine_logs" | "$LOG_CHECKER_BIN" "$selected_output"); then
+  exit 1
+fi
+if [[ $mode == encoder ]]; then
+  printf '%s\n' "$encoder"
+else
+  printf '%s\n' "$selected_output"
+fi

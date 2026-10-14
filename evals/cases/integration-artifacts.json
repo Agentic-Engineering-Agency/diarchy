@@ -1,0 +1,20 @@
+{
+  "schema_version": "eval.case.v1",
+  "case_id": "sharing-integration-artifacts",
+  "title": "Installers doctors drop app and KVM tests exist",
+  "suite": "smoke",
+  "risk_tier": "critical",
+  "task_type": "repository_smoke",
+  "source": {"kind": "spec", "path": "docs/superpowers/specs/2026-07-29-clipboard-file-transfer-design.md"},
+  "privacy": {"classification": "public", "sanitized": true},
+  "expected": {"success_criteria": ["Both installers and doctors, the drop app source, and integration tests exist."]},
+  "judge": {"type": "deterministic", "assertions": [
+    {"type": "file_exists", "path": "client/install-clipboard-file-transfer.sh"},
+    {"type": "file_exists", "path": "host/install-clipboard-file-transfer.sh"},
+    {"type": "file_exists", "path": "client/diarchy-clipboard-file-transfer-client-doctor"},
+    {"type": "file_exists", "path": "host/diarchy-file-transfer-host-doctor"},
+    {"type": "file_exists", "path": "client/Diarchy Drop.applescript"},
+    {"type": "file_exists", "path": "tests/test_clipboard_file_transfer_install.py"},
+    {"type": "file_exists", "path": "tests/test_diarchy_kvm_hook.py"}
+  ]}
+}

@@ -1,0 +1,26 @@
+# Paths that the public export must leave out. See scripts/check-public-tree.
+# Syntax: one path per line, relative to the repo root. An entry matches a file or everything under a directory.
+# `*` and `?` are shell globs. Lines that start with `#` are comments.
+
+# Tracked symlink to an absolute path in the maintainer's home (SEC-10).
+.omp
+# Local agent tooling state (SEC-15).
+.pi
+# Private orchestrator rules for the maintainer's agent setup (SEC-11).
+AGENTS.md
+# Private assistant rules for the maintainer's agent setup (SEC-11).
+CLAUDE.md
+# Local working notes, plans and reports (SEC-15).
+.superpowers
+# Local git worktrees (SEC-15).
+.worktrees
+# Local list of the maintainer's real values for the leak gate (SEC-15).
+.personal-data-denylist
+# Local environment files (SEC-15).
+.env
+.env.*
+# Local keys and certificates (SEC-15).
+*.pem
+*.key
+# Local overrides (SEC-15).
+*.local.*

@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOONLIGHT_BIN=${MOONLIGHT_BIN:-"$HOME/Applications/Moonlight.app/Contents/MacOS/Moonlight"}
+PING_BIN=${PING_BIN:-/sbin/ping}
+ROUTE_BIN=${ROUTE_BIN:-/sbin/route}
+CONNECT_BIN=${CONNECT_BIN:-/usr/bin/nc}
+SUNSHINE_CONTROL_PORT=${SUNSHINE_CONTROL_PORT:-47984}
+
+usage() {
+  cat <<'EOF'
+Usage: diarchy-stream [--diagnose|--dry-run] [--force-lan|--force-remote]
+EOF
+}
+
+fail() {
+  printf 'diarchy-stream: %s\n' "$*" >&2
+  exit 1
+}
+SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+CONFIG_LIB=${DIARCHY_CONFIG_SH:-$SCRIPT_PATH/diarchy-config.sh}
+
+probe_candidate() {
+  local host=$1 candidate=$2 ping_output ping_status route_output samples
+  if [[ -z $host ]]; then
+    probe_reachable=false
+    probe_loss=100
+    probe_median=unavailable
+    probe_interface=unavailable
+    return 1
+  fi
+
+  probe_reachable=false
+  probe_loss=100
+  probe_median=unavailable
+  probe_interface=unavailable
+
+  if ping_output=$("$PING_BIN" -n -c 4 -W 1000 "$host" 2>&1); then
+    ping_status=0
+  else
+    ping_status=$?
+  fi
+
+  probe_loss=$(printf '%s\n' "$ping_output" | awk '
+    /packet loss/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /%$/) {
+          gsub(/%/, "", $i)
+          print $i
+          exit
+        }
+      }
+    }
+  ')
+  probe_loss=${probe_loss:-100}
+  samples=$(printf '%s\n' "$ping_output" \
+    | sed -nE 's/.*time[=<]([0-9.]+) ms.*/\1/p' \
+    | sort -n)
+  if [[ -n "$samples" ]]; then
+    probe_median=$(printf '%s\n' "$samples" | awk '
+      { values[NR] = $1 }
+      END {
+        if (NR % 2 == 1) {
+          printf "%.3f", values[(NR + 1) / 2]
+        } else if (NR > 0) {
+          printf "%.3f", (values[NR / 2] + values[NR / 2 + 1]) / 2
+        }
+      }
+    ')
+  fi
+
+  if (( ping_status != 0 )) || [[ "$probe_median" == unavailable ]]; then
+    return 1
+  fi
+  if awk -v loss="$probe_loss" 'BEGIN { exit !(loss >= 100) }'; then
+    return 1
+  fi
+  if ! route_output=$("$ROUTE_BIN" -n get "$host" 2>&1); then
+    return 1
+  fi
+  probe_interface=$(printf '%s\n' "$route_output" | awk '$1 == "interface:" { print $2; exit }')
+  if [[ -z "$probe_interface" ]]; then
+    probe_interface=unavailable
+    return 1
+  fi
+  if [[ "$candidate" == lan ]]; then
+    case "$probe_interface" in
+      utun*|tun*|tap*|tailscale*|ipsec*|ppp*) return 1 ;;
+    esac
+  fi
+  if ! "$CONNECT_BIN" -z -G 3 -w 3 "$host" "$SUNSHINE_CONTROL_PORT" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  probe_reachable=true
+  return 0
+}
+
+print_candidate() {
+  local name=$1 host=$2 reachable=$3 loss=$4 median=$5 interface=$6
+  printf 'candidate=%s host=%s reachable=%s loss_pct=%s median_ms=%s interface=%s\n' \
+    "$name" "${host:-unset}" "$reachable" "$loss" "$median" "$interface"
+}
+
+save_lan_probe() {
+  lan_reachable=$probe_reachable
+  lan_loss=$probe_loss
+  lan_median=$probe_median
+  lan_interface=$probe_interface
+}
+
+save_remote_probe() {
+  remote_reachable=$probe_reachable
+  remote_loss=$probe_loss
+  remote_median=$probe_median
+  remote_interface=$probe_interface
+}
+
+probe_lan() {
+  probe_candidate "$LAN_HOST" lan || true
+  save_lan_probe
+}
+
+probe_remote() {
+  probe_candidate "$TAILSCALE_HOST" remote || true
+  save_remote_probe
+}
+
+launch_moonlight() {
+  local host=$1 profile=$2
+  local resolution fps bitrate codec
+  case "$profile" in
+    lan|remote)
+      resolution=$DIARCHY_STREAM_RESOLUTION
+      fps=$DIARCHY_STREAM_FPS
+      if [[ "$profile" == lan ]]; then
+        bitrate=25000
+      else
+        bitrate=15000
+      fi
+      codec=HEVC
+      ;;
+    degraded)
+      resolution=1280x720
+      fps=$(( DIARCHY_STREAM_FPS < 60 ? DIARCHY_STREAM_FPS : 60 ))
+      bitrate=8000
+      codec=H.264
+      ;;
+    *) fail "unknown profile: $profile" ;;
+  esac
+
+  [[ -x "$MOONLIGHT_BIN" ]] || fail "Moonlight executable not found: $MOONLIGHT_BIN"
+  local -a moonlight_args=(
+    stream "$host" Desktop
+    --resolution "$resolution"
+    --fps "$fps"
+    --bitrate "$bitrate"
+    --display-mode fullscreen
+    --absolute-mouse
+    --capture-system-keys always
+    --video-codec "$codec"
+    --video-decoder hardware
+    --no-audio-on-host
+  )
+  [[ $DIARCHY_STREAM_OVERLAY == 1 ]] &&
+    moonlight_args+=(--performance-overlay)
+  exec "$MOONLIGHT_BIN" "${moonlight_args[@]}"
+}
+
+dry_run=${DIARCHY_DRY_RUN:-0}
+diagnose=0
+force_lan=0
+force_remote=0
+for argument in "$@"; do
+  case "$argument" in
+    --dry-run) dry_run=1 ;;
+    --diagnose) diagnose=1 ;;
+    --force-lan) force_lan=1 ;;
+    --force-remote) force_remote=1 ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; exit 64 ;;
+  esac
+done
+if (( force_lan && force_remote )); then
+  printf 'diarchy-stream: --force-lan and --force-remote are mutually exclusive\n' >&2
+  exit 64
+fi
+[[ -r $CONFIG_LIB ]] || fail "diarchy-config.sh not found next to the launcher"
+# shellcheck source=/dev/null
+source "$CONFIG_LIB"
+diarchy_config_load || fail "configuration could not be loaded"
+LAN_HOST=$DIARCHY_LAN_HOST
+TAILSCALE_HOST=$DIARCHY_TAILSCALE_HOST
+
+lan_reachable=false
+lan_loss=100
+lan_median=unavailable
+lan_interface=unavailable
+remote_reachable=false
+remote_loss=100
+remote_median=unavailable
+remote_interface=unavailable
+
+if (( diagnose )); then
+  probe_lan
+  probe_remote
+  print_candidate lan "$LAN_HOST" "$lan_reachable" "$lan_loss" "$lan_median" "$lan_interface"
+  print_candidate remote "$TAILSCALE_HOST" "$remote_reachable" "$remote_loss" "$remote_median" "$remote_interface"
+elif (( force_lan )); then
+  probe_lan
+elif (( force_remote )); then
+  probe_remote
+else
+  probe_lan
+  if [[ "$lan_reachable" != true ]]; then
+    probe_remote
+  fi
+fi
+
+if (( force_remote )); then
+  [[ "$remote_reachable" == true ]] || fail "forced Tailscale route is unreachable"
+  route_name=remote
+  host=$TAILSCALE_HOST
+  profile=remote
+  loss=$remote_loss
+  median=$remote_median
+  interface=$remote_interface
+elif [[ "$lan_reachable" == true ]]; then
+  route_name=lan
+  host=$LAN_HOST
+  loss=$lan_loss
+  median=$lan_median
+  interface=$lan_interface
+  if awk -v loss="$loss" -v median="$median" \
+    'BEGIN { exit !(loss > 2 || median > 25) }'; then
+    profile=degraded
+  else
+    profile=lan
+  fi
+elif (( force_lan )); then
+  fail "forced LAN route is unreachable"
+elif [[ "$remote_reachable" == true ]]; then
+  route_name=remote
+  host=$TAILSCALE_HOST
+  profile=remote
+  loss=$remote_loss
+  median=$remote_median
+  interface=$remote_interface
+else
+  fail "Host is unreachable on LAN and Tailscale"
+fi
+
+printf 'route=%s host=%s profile=%s loss_pct=%s median_ms=%s interface=%s\n' \
+  "$route_name" "$host" "$profile" "$loss" "$median" "$interface"
+
+if (( diagnose || dry_run == 1 )); then
+  exit 0
+fi
+launch_moonlight "$host" "$profile"

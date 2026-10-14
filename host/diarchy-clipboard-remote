@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import signal
+import subprocess
+import sys
+import threading
+import time
+from typing import BinaryIO, Callable
+
+MAX_BYTES = 102400
+HEADER = re.compile(rb"^CLIP ([0-9a-f]{64}) ([0-9]+)\n$")
+WL_COPY_COMMAND = ["wl-copy", "--foreground", "--type", "text/plain"]
+# Consecutive failed clipboard reads before the pump checks whether its Wayland socket still answers.
+WAYLAND_RETRY_AFTER = 5
+_stdout_lock = threading.Lock()
+
+def validate_text_payload(payload: bytes) -> bool:
+    if len(payload) > MAX_BYTES:
+        return False
+    try:
+        payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def encode_frame(payload: bytes) -> bytes:
+    if not validate_text_payload(payload):
+        raise ValueError("clipboard payload must be valid UTF-8 text within size limit")
+    digest = hashlib.sha256(payload).hexdigest().encode("ascii")
+    return b"CLIP " + digest + b" " + str(len(payload)).encode("ascii") + b"\n" + payload
+
+
+def _read_source_byte(stream: BinaryIO, pending: bytearray) -> bytes:
+    if pending:
+        value = bytes(pending[:1])
+        del pending[:1]
+        return value
+    return stream.read(1)
+
+
+def _read_source_line(stream: BinaryIO, pending: bytearray, limit: int) -> bytes:
+    line = bytearray()
+    while len(line) < limit:
+        value = _read_source_byte(stream, pending)
+        if not value:
+            break
+        line.extend(value)
+        if value == b"\n":
+            break
+    return bytes(line)
+
+
+def _read_source_exact(stream: BinaryIO, pending: bytearray, length: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < length:
+        if pending:
+            take = min(length - len(payload), len(pending))
+            payload.extend(pending[:take])
+            del pending[:take]
+            continue
+        chunk = stream.read(length - len(payload))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+def diagnostic_message(
+    decision: str,
+    direction: str,
+    payload: bytes | None = None,
+    *,
+    byte_length: int | None = None,
+) -> str:
+    """Metadata only: a digest prefix would let a log reader confirm a guess of a short clipboard secret."""
+    if byte_length is None:
+        byte_length = len(payload) if payload is not None else 0
+    return f"{decision} direction={direction} bytes={byte_length}"
+
+
+def emit_diagnostic(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def decode_frame(
+    stream: BinaryIO,
+    diagnostic: Callable[[str], None] | None = None,
+    direction: str = "local",
+) -> bytes | None:
+    pending = bytearray()
+    marker = b"CLIP "
+    discarded_bytes = 0
+    decode_reported = False
+    while True:
+        matched = 0
+        while matched < len(marker):
+            value = _read_source_byte(stream, pending)
+            if not value:
+                if (discarded_bytes or matched) and not decode_reported and diagnostic is not None:
+                    diagnostic(
+                        diagnostic_message(
+                            "dropped:decode",
+                            direction,
+                            byte_length=discarded_bytes + matched,
+                        )
+                    )
+                return None
+            if value == marker[matched : matched + 1]:
+                matched += 1
+            else:
+                discarded_bytes += matched + (0 if value == marker[:1] else 1)
+                matched = 1 if value == marker[:1] else 0
+
+        if discarded_bytes and not decode_reported and diagnostic is not None:
+            diagnostic(
+                diagnostic_message(
+                    "dropped:decode",
+                    direction,
+                    byte_length=discarded_bytes,
+                )
+            )
+        discarded_bytes = 0
+        decode_reported = False
+
+        suffix = _read_source_line(stream, pending, 96)
+        header = marker + suffix
+        match = HEADER.match(header)
+        if not match or int(match.group(2)) > MAX_BYTES:
+            if diagnostic is not None:
+                diagnostic(
+                    diagnostic_message(
+                        "dropped:decode",
+                        direction,
+                        byte_length=len(header),
+                    )
+                )
+            decode_reported = True
+            pending = bytearray(header[1:]) + pending
+            continue
+
+        expected = match.group(1).decode("ascii")
+        length = int(match.group(2))
+        payload = _read_source_exact(stream, pending, length)
+        digest = hashlib.sha256(payload).hexdigest()
+        if (
+            len(payload) != length
+            or digest != expected
+            or not validate_text_payload(payload)
+        ):
+            if diagnostic is not None:
+                diagnostic(
+                    diagnostic_message(
+                        "dropped:decode",
+                        direction,
+                        payload,
+                        byte_length=length,
+                    )
+                )
+            continue
+        return payload
+
+
+class ClipboardState:
+    def __init__(self) -> None:
+        self.last_out_hash: str | None = None
+        self.last_in_hash: str | None = None
+
+
+def _is_nonempty_text(payload: bytes | None) -> bool:
+    if not payload:
+        return False
+    try:
+        payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def apply_incoming_payload(
+    payload: bytes,
+    state: ClipboardState,
+    read_current: Callable[[], bytes | None],
+    apply_payload: Callable[[bytes], bool],
+    diagnostic: Callable[[str], None],
+    direction: str,
+) -> bool:
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest == state.last_out_hash:
+        diagnostic(diagnostic_message("dropped:echo", direction, payload))
+        return False
+    if not payload and not _is_nonempty_text(read_current()):
+        diagnostic(diagnostic_message("empty-no-change", direction, payload))
+        return False
+    previous = state.last_in_hash
+    state.last_in_hash = digest
+    if not apply_payload(payload):
+        state.last_in_hash = previous
+        return False
+    diagnostic(diagnostic_message("applied", direction, payload))
+    return True
+
+
+def should_emit(local_digest: str, last_incoming_digest: str | None) -> bool:
+    return bool(local_digest) and local_digest != last_incoming_digest
+
+
+def frame_for_local_change(payload: bytes, last_incoming_digest: str | None) -> bytes | None:
+    if not payload or not validate_text_payload(payload):
+        return None
+    digest = hashlib.sha256(payload).hexdigest()
+    if not should_emit(digest, last_incoming_digest):
+        return None
+    return encode_frame(payload)
+
+
+def is_owned_wl_copy(process: object | None) -> bool:
+    if process is None:
+        return False
+    args = getattr(process, "args", None)
+    return list(args) == WL_COPY_COMMAND
+
+
+def reap_owned(process: object | None, timeout: float = 2.0) -> None:
+    if not is_owned_wl_copy(process):
+        return
+    if getattr(process, "poll", lambda: None)() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except TypeError:
+        process.wait()
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
+
+
+def replace_owner(current: object | None, replacement: object | None) -> object | None:
+    reap_owned(current)
+    return replacement
+
+
+def shutdown_owner(owner: object | None) -> None:
+    reap_owned(owner)
+
+
+def _which(name: str) -> str:
+    return shutil.which(name) or name
+
+
+def discover_wayland_environment(
+    env: dict[str, str] | None = None,
+    check_output: Callable[..., bytes] = subprocess.check_output,
+    refresh: bool = False,
+) -> dict[str, str]:
+    """`refresh` looks for the socket again even when `WAYLAND_DISPLAY` is set; a failed lookup keeps the old value."""
+    discovered = dict(env or os.environ)
+    discovered.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if discovered.get("WAYLAND_DISPLAY") and not refresh:
+        return discovered
+    try:
+        raw = check_output(
+            ["hyprctl", "instances", "-j"],
+            env=discovered,
+            timeout=2.0,
+            stderr=subprocess.DEVNULL,
+        )
+        instances = json.loads(raw)
+        usable = [
+            item
+            for item in instances
+            if isinstance(item, dict)
+            and isinstance(item.get("pid"), int)
+            and item["pid"] > 0
+            and isinstance(item.get("instance"), str)
+            and item["instance"]
+            and isinstance(item.get("wl_socket"), str)
+            and item["wl_socket"]
+        ]
+        active = max(usable, key=lambda item: item.get("time", 0))
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, ValueError):
+        return discovered
+    discovered["WAYLAND_DISPLAY"] = active["wl_socket"]
+    return discovered
+
+
+def refresh_wayland_environment(check_output: Callable[..., bytes] = subprocess.check_output) -> bool:
+    """Look for the Wayland socket of the newest Hyprland instance again. True when `WAYLAND_DISPLAY` changed."""
+    discovered = discover_wayland_environment(check_output=check_output, refresh=True)
+    changed = discovered.get("WAYLAND_DISPLAY") != os.environ.get("WAYLAND_DISPLAY")
+    os.environ.update(discovered)
+    return changed
+
+
+def wayland_socket_alive() -> bool:
+    """True when something accepts connections on the current Wayland socket. An empty clipboard still passes."""
+    name = os.environ.get("WAYLAND_DISPLAY", "")
+    if not name:
+        return False
+    path = name if os.path.isabs(name) else os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", name
+    )
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(path)
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def report_to_peer(message: str) -> None:
+    """Log the problem and also write one plain line on stdout. The Mac bridge counts it as `dropped:decode`."""
+    emit_diagnostic(message)
+    with _stdout_lock:
+        sys.stdout.buffer.write(f"diarchy-clipboard-remote: {message}\n".encode("utf-8", "replace"))
+        sys.stdout.buffer.flush()
+
+
+def wl_copy_command() -> list[str]:
+    command = WL_COPY_COMMAND.copy()
+    command[0] = _which(command[0])
+    return command
+
+
+def read_host_clipboard_raw(env: dict[str, str] | None = None, timeout: float = 2.0) -> bytes | None:
+    """The host clipboard text, or `None` on failure. At most `MAX_BYTES + 1` bytes are read, so a huge selection
+    costs a bounded amount of memory; a result longer than `MAX_BYTES` means "over the cap"."""
+    try:
+        process = subprocess.Popen(
+            [_which("wl-paste"), "--type", "text/plain", "--no-newline"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, ValueError):
+        return None
+    timed_out = threading.Event()
+
+    def expire() -> None:
+        timed_out.set()
+        process.kill()
+
+    timer = threading.Timer(timeout, expire)
+    timer.start()
+    try:
+        data = process.stdout.read(MAX_BYTES + 1)
+        over_cap = len(data) > MAX_BYTES
+        if over_cap:
+            process.kill()
+        returncode = process.wait()
+    finally:
+        timer.cancel()
+        process.stdout.close()
+    if timed_out.is_set() or (returncode != 0 and not over_cap):
+        return None
+    return data
+
+
+def read_host_clipboard(env: dict[str, str] | None = None, timeout: float = 2.0) -> bytes | None:
+    payload = read_host_clipboard_raw(env=env, timeout=timeout)
+    return payload if payload is not None and validate_text_payload(payload) else None
+
+
+def start_wl_copy(payload: bytes, popen: Callable[..., object] = subprocess.Popen) -> object:
+    if not validate_text_payload(payload):
+        raise ValueError("clipboard payload must be valid UTF-8 text within size limit")
+    child = popen(WL_COPY_COMMAND, stdin=subprocess.PIPE)
+    stdin = getattr(child, "stdin", None)
+    if stdin is not None:
+        stdin.write(payload)
+        try:
+            stdin.fileno()
+        except Exception:
+            pass
+        else:
+            stdin.close()
+    return child
+
+
+class WlCopyOwner:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner: object | None = None
+        self._stopped = False
+
+    @property
+    def owner(self) -> object | None:
+        with self._lock:
+            return self._owner
+
+    def install_payload(self, payload: bytes, popen: Callable[..., object] = subprocess.Popen) -> bool:
+        if not validate_text_payload(payload):
+            return False
+        with self._lock:
+            if self._stopped:
+                return False
+            reap_owned(self._owner)
+            if self._stopped:
+                return False
+            self._owner = start_wl_copy(payload, popen=popen)
+            return True
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._stopped = True
+            reap_owned(self._owner)
+            self._owner = None
+
+
+def apply_payload_to_wl_copy(payload: bytes, owner: object | None, popen: Callable[..., object] = subprocess.Popen) -> object | None:
+    manager = WlCopyOwner()
+    manager._owner = owner
+    manager.install_payload(payload, popen=popen)
+    return manager.owner
+
+
+
+
+def _stdin_to_wl_copy(
+    stop: threading.Event,
+    owner: WlCopyOwner,
+    state: ClipboardState,
+    state_lock: threading.Lock,
+) -> None:
+    while not stop.is_set():
+        payload = decode_frame(sys.stdin.buffer, emit_diagnostic, "local")
+        if payload is None:
+            stop.set()
+            return
+        if not wayland_socket_alive():
+            refresh_wayland_environment()
+        with state_lock:
+            apply_incoming_payload(
+                payload,
+                state,
+                read_host_clipboard_raw,
+                owner.install_payload,
+                emit_diagnostic,
+                "local",
+            )
+
+
+def _wl_paste_to_stdout(
+    stop: threading.Event,
+    poll_ms: int,
+    state: ClipboardState,
+    state_lock: threading.Lock,
+) -> None:
+    previous_digest: str | None = None
+    failures = 0
+    reported = False
+    while not stop.is_set():
+        payload = read_host_clipboard_raw()
+        if payload is None:
+            failures += 1
+            if failures % WAYLAND_RETRY_AFTER == 0 and not wayland_socket_alive():
+                refresh_wayland_environment()
+                if not reported and not wayland_socket_alive():
+                    reported = True
+                    report_to_peer(
+                        "host clipboard unavailable: the Wayland socket "
+                        f"{os.environ.get('WAYLAND_DISPLAY', '(unset)')} does not answer. "
+                        "Log in to Hyprland on the host. The Diarchy app reconnects the clipboard by itself."
+                    )
+            time.sleep(poll_ms / 1000)
+            continue
+        failures = 0
+        reported = False
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest == previous_digest:
+            time.sleep(poll_ms / 1000)
+            continue
+        previous_digest = digest
+        if len(payload) > MAX_BYTES:
+            emit_diagnostic(diagnostic_message("dropped:cap", "remote", payload))
+            time.sleep(poll_ms / 1000)
+            continue
+        if not validate_text_payload(payload):
+            emit_diagnostic(diagnostic_message("dropped:decode", "remote", payload))
+            time.sleep(poll_ms / 1000)
+            continue
+        with state_lock:
+            if digest == state.last_in_hash:
+                emit_diagnostic(diagnostic_message("dropped:echo", "remote", payload))
+                time.sleep(poll_ms / 1000)
+                continue
+        with _stdout_lock:
+            sys.stdout.buffer.write(encode_frame(payload))
+            sys.stdout.buffer.flush()
+        with state_lock:
+            state.last_out_hash = digest
+        emit_diagnostic(diagnostic_message("sent", "remote", payload))
+        time.sleep(poll_ms / 1000)
+
+
+def run_remote(poll_ms: int) -> int:
+    stop = threading.Event()
+    owner = WlCopyOwner()
+    state = ClipboardState()
+    state_lock = threading.Lock()
+
+    def shutdown(signum: int | None = None, frame: object | None = None) -> None:
+        stop.set()
+        owner.shutdown()
+        if signum is not None:
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    threads = [
+        threading.Thread(target=_stdin_to_wl_copy, args=(stop, owner, state, state_lock), daemon=True),
+        threading.Thread(target=_wl_paste_to_stdout, args=(stop, poll_ms, state, state_lock), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        while not stop.is_set():
+            time.sleep(0.1)
+        return 0
+    finally:
+        shutdown()
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Diarchy clipboard remote pump")
+    parser.add_argument("--poll-ms", type=int, default=200)
+    args = parser.parse_args(argv)
+    os.environ.update(discover_wayland_environment())
+    if args.poll_ms < 1:
+        return 64
+    return run_remote(args.poll_ms)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

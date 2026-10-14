@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Sebastiangmz/diarchy/security/advisories/new
+    about: Private report. Do not use a public issue for security bugs.
+  - name: Bug in Sunshine, Moonlight, Lan Mouse, Omarchy or Hyprland
+    url: https://github.com/Sebastiangmz/diarchy/blob/main/CONTRIBUTING.md#3-where-not-to-report
+    about: Report upstream bugs to the upstream project. Report here only if Diarchy causes the bug.

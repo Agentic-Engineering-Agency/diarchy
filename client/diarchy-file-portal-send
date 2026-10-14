@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Send portal drops to the host from stable no-follow file descriptors."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import stat
+import struct
+import threading
+import subprocess
+import sys
+import time
+from urllib.parse import quote
+from pathlib import Path
+from typing import BinaryIO, Sequence
+
+MAX_RECORD_BYTES = 65_536
+MAX_OUTPUT_BYTES = 8_192
+CHUNK_BYTES = 1024 * 1024
+SENDER_USAGE = "usage: diarchy-file-portal-send [--help] -- PATH..."
+_ACTIVE_CHILD: subprocess.Popen[bytes] | None = None
+_ACTIVE_CHILD_LOCK = threading.RLock()
+_STOP_REQUESTED = threading.Event()
+
+
+def _signal_process_group(child: subprocess.Popen[bytes], sig: signal.Signals) -> None:
+    if child.poll() is not None:
+        return
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _request_stop(*_ignored: object) -> None:
+    _STOP_REQUESTED.set()
+    with _ACTIVE_CHILD_LOCK:
+        child = _ACTIVE_CHILD
+    if child is not None:
+        _signal_process_group(child, signal.SIGTERM)
+
+def _terminate_on_stop(child: subprocess.Popen[bytes]) -> None:
+    while child.poll() is None and not _STOP_REQUESTED.wait(0.25):
+        pass
+    if child.poll() is not None or not _STOP_REQUESTED.is_set():
+        return
+    _signal_process_group(child, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.25)
+    if child.poll() is None:
+        _signal_process_group(child, signal.SIGKILL)
+
+
+def _raise_if_stopping() -> None:
+    if _STOP_REQUESTED.is_set():
+        raise InterruptedError("transfer cancelled")
+
+
+def _monitor_parent(parent_pid: int) -> None:
+    while not _STOP_REQUESTED.wait(0.25):
+        try:
+            os.kill(parent_pid, 0)
+        except ProcessLookupError:
+            _request_stop()
+            return
+        except PermissionError:
+            return
+
+
+def encode_record(record: dict[str, object]) -> bytes:
+    payload = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not 0 < len(payload) <= MAX_RECORD_BYTES:
+        raise ValueError("invalid portal record length")
+    return struct.pack("!I", len(payload)) + payload
+
+
+def write_record(stream: BinaryIO, record: dict[str, object]) -> None:
+    stream.write(encode_record(record))
+
+
+def stable_open(parent_fd: int, name: str, expected: os.stat_result, flags: int) -> int:
+    fd = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent_fd)
+    actual = os.fstat(fd)
+    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        os.close(fd)
+        raise ValueError(f"source changed while opening: {name}")
+    return fd
+
+
+def ensure_unchanged(before: os.stat_result, after: os.stat_result, display: str) -> None:
+    fields_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    fields_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    if fields_before != fields_after:
+        raise ValueError(f"source changed during transfer: {display}")
+
+
+def stream_file(stream: BinaryIO, fd: int, relative: str, metadata: os.stat_result) -> None:
+    _raise_if_stopping()
+    write_record(
+        stream,
+        {
+            "type": "entry",
+            "path": relative,
+            "kind": "file",
+            "size": metadata.st_size,
+            "mtime_ns": metadata.st_mtime_ns,
+        },
+    )
+    remaining = metadata.st_size
+    while remaining:
+        _raise_if_stopping()
+        chunk = os.read(fd, min(CHUNK_BYTES, remaining))
+        if not chunk:
+            raise ValueError(f"source shrank during transfer: {relative or '<root>'}")
+        stream.write(chunk)
+        remaining -= len(chunk)
+    _raise_if_stopping()
+    if os.read(fd, 1):
+        raise ValueError(f"source grew during transfer: {relative or '<root>'}")
+    ensure_unchanged(metadata, os.fstat(fd), relative or "<root>")
+
+
+def stream_directory(
+    stream: BinaryIO,
+    fd: int,
+    relative: str,
+    metadata: os.stat_result,
+    count: list[int],
+) -> None:
+    _raise_if_stopping()
+    write_record(
+        stream,
+        {
+            "type": "entry",
+            "path": relative,
+            "kind": "directory",
+            "mtime_ns": metadata.st_mtime_ns,
+        },
+    )
+    count[0] += 1
+    names = sorted(os.listdir(fd))
+    for name in names:
+        _raise_if_stopping()
+        child = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        child_relative = f"{relative}/{name}" if relative else name
+        if stat.S_ISREG(child.st_mode):
+            child_fd = stable_open(fd, name, child, os.O_RDONLY)
+            try:
+                stream_file(stream, child_fd, child_relative, child)
+                count[0] += 1
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISDIR(child.st_mode):
+            child_fd = stable_open(fd, name, child, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                stream_directory(stream, child_fd, child_relative, child, count)
+            finally:
+                os.close(child_fd)
+        else:
+            raise ValueError(f"unsupported source item: {child_relative}")
+    ensure_unchanged(metadata, os.fstat(fd), relative or "<root>")
+
+
+def stream_path(path: Path, stream: BinaryIO) -> None:
+    _raise_if_stopping()
+    source = path.expanduser().absolute()
+    if source.name in {"", ".", ".."} or "/" in source.name or len(os.fsencode(source.name)) > 255:
+        raise ValueError("invalid source basename")
+    parent_fd = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        metadata = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+        if stat.S_ISREG(metadata.st_mode):
+            kind = "file"
+            source_fd = stable_open(parent_fd, source.name, metadata, os.O_RDONLY)
+        elif stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+            source_fd = stable_open(parent_fd, source.name, metadata, os.O_RDONLY | os.O_DIRECTORY)
+        else:
+            raise ValueError(f"unsupported source item: {source.name}")
+    finally:
+        os.close(parent_fd)
+
+    try:
+        write_record(stream, {"type": "start", "name": source.name, "kind": kind})
+        count = [0]
+        if kind == "file":
+            stream_file(stream, source_fd, "", metadata)
+            count[0] = 1
+        else:
+            stream_directory(stream, source_fd, "", metadata, count)
+        write_record(stream, {"type": "finish", "entries": count[0]})
+        stream.flush()
+    finally:
+        os.close(source_fd)
+
+
+def resolve_ssh_argv(route_script: Path) -> list[str]:
+    bash = """
+set -euo pipefail
+source "$1"
+select_diarchy_route auto
+printf '%s\\0' "$DIARCHY_SSH_ALIAS" "${diarchy_ssh_options[@]}"
+"""
+    raw = subprocess.check_output(
+        ["/bin/bash", "-c", bash, "diarchy-file-portal-send", str(route_script)]
+    )
+    parts = [os.fsdecode(part) for part in raw.split(b"\0") if part]
+    if not parts:
+        raise RuntimeError("route selection returned no SSH target")
+    alias, *options = parts
+    return [
+        os.environ.get("SSH_BIN", "ssh"),
+        *options,
+        alias,
+        "~/.local/bin/diarchy-file-portal-ingest",
+    ]
+
+
+def drain_bounded(stream: BinaryIO, result: list[tuple[bytes, bool]]) -> None:
+    captured = bytearray()
+    too_large = False
+    while chunk := stream.read(4096):
+        remaining = MAX_OUTPUT_BYTES + 1 - len(captured)
+        if remaining > 0:
+            captured.extend(chunk[:remaining])
+        if len(captured) > MAX_OUTPUT_BYTES or len(chunk) > remaining:
+            too_large = True
+    result.append((bytes(captured), too_large))
+
+
+def send_one(path: Path, ssh_argv: Sequence[str]) -> tuple[bool, str]:
+    global _ACTIVE_CHILD
+    child = subprocess.Popen(
+        list(ssh_argv),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    with _ACTIVE_CHILD_LOCK:
+        _ACTIVE_CHILD = child
+    stop_monitor = threading.Thread(target=_terminate_on_stop, args=(child,))
+    stop_monitor.start()
+    assert child.stdin is not None and child.stdout is not None and child.stderr is not None
+    stdout_result: list[tuple[bytes, bool]] = []
+    stderr_result: list[tuple[bytes, bool]] = []
+    readers = [
+        threading.Thread(target=drain_bounded, args=(child.stdout, stdout_result)),
+        threading.Thread(target=drain_bounded, args=(child.stderr, stderr_result)),
+    ]
+    for reader in readers:
+        reader.start()
+    local_error = ""
+    try:
+        try:
+            stream_path(path, child.stdin)
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            local_error = str(exc).replace("\n", " ")[:512]
+        finally:
+            try:
+                child.stdin.close()
+            except BrokenPipeError:
+                pass
+        stop_deadline: float | None = None
+        while True:
+            try:
+                child.wait(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if _STOP_REQUESTED.is_set():
+                    if stop_deadline is None:
+                        stop_deadline = time.monotonic() + 5
+                        _signal_process_group(child, signal.SIGTERM)
+                    elif time.monotonic() >= stop_deadline:
+                        _signal_process_group(child, signal.SIGKILL)
+        stop_monitor.join()
+        for reader in readers:
+            reader.join()
+        child.stdout.close()
+        child.stderr.close()
+    finally:
+        with _ACTIVE_CHILD_LOCK:
+            if _ACTIVE_CHILD is child:
+                _ACTIVE_CHILD = None
+    stdout, stdout_too_large = stdout_result[0]
+    stderr, stderr_too_large = stderr_result[0]
+    encoded_name = quote(path.name, safe="")
+    if stdout_too_large or stderr_too_large:
+        return False, f"portal-send name={encoded_name} status=failed detail=remote-output-too-large"
+    remote_line = stdout.decode("utf-8", "replace").strip().splitlines()
+    if local_error:
+        return False, f"portal-send name={encoded_name} status=rejected detail={local_error}"
+    if _STOP_REQUESTED.is_set():
+        return False, f"portal-send name={encoded_name} status=failed detail=cancelled"
+    if child.returncode == 0 and remote_line and " status=ok" in remote_line[-1]:
+        return True, remote_line[-1]
+    if remote_line:
+        return False, remote_line[-1]
+    detail = stderr.decode("utf-8", "replace").strip().replace("\n", " ")[:512]
+    return False, f"portal-send name={encoded_name} status=failed detail={detail or f'ssh-exit-{child.returncode}'}"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {"--help", "-h"}:
+        print(SENDER_USAGE)
+        return 0
+    if arguments and arguments[0] == "--":
+        arguments.pop(0)
+    elif arguments and arguments[0].startswith("-"):
+        print(SENDER_USAGE, file=sys.stderr)
+        return 2
+    if not arguments:
+        print(SENDER_USAGE, file=sys.stderr)
+        return 64
+    script_dir = Path(__file__).resolve().parent
+    route_script = Path(os.environ.get("DIARCHY_FILE_ROUTE_SH", script_dir / "diarchy-route.sh"))
+    parent_pid_value = os.environ.get("DIARCHY_FILE_PORTAL_PARENT_PID")
+    if parent_pid_value:
+        try:
+            parent_pid = int(parent_pid_value)
+        except ValueError:
+            print("portal-send status=failed detail=invalid-parent-pid")
+            return 1
+        threading.Thread(target=_monitor_parent, args=(parent_pid,), daemon=True).start()
+    try:
+        ssh_argv = resolve_ssh_argv(route_script)
+    except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+        print(f"portal-send status=failed detail={str(exc)[:512]}")
+        return 1
+    succeeded = 0
+    failed = 0
+    for raw_path in arguments:
+        if _STOP_REQUESTED.is_set():
+            break
+        ok, line = send_one(Path(raw_path), ssh_argv)
+        print(line)
+        if ok:
+            succeeded += 1
+        else:
+            failed += 1
+    print(f"portal-send-summary sent={succeeded} failed={failed}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    raise SystemExit(main())

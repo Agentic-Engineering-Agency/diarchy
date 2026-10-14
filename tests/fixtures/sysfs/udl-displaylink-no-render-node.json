@@ -1,0 +1,22 @@
+{
+  "source": "synthetic",
+  "cards": [
+    {
+      "card": "card0",
+      "pci": "0000:00:14.0",
+      "vendor": "0x17e9",
+      "device": "0x01ae",
+      "driver": "udl",
+      "render": null,
+      "boot_vga": false,
+      "connectors": [
+        "DVI-I-1"
+      ]
+    }
+  ],
+  "expect": {
+    "DVI-I-1": null,
+    "DIARCHY": null,
+    "null": null
+  }
+}

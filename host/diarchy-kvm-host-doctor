@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION=0.11.0
+SERVICE=diarchy-kvm.service
+PORT=4242
+BIN=${LAN_MOUSE_BIN:-$HOME/.local/bin/lan-mouse}
+CONFIG=${LAN_MOUSE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/config.toml}
+CERT=${LAN_MOUSE_CERT:-${XDG_CONFIG_HOME:-$HOME/.config}/lan-mouse/lan-mouse.pem}
+SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-systemctl}
+SS_BIN=${SS_BIN:-ss}
+OPENSSL_BIN=${OPENSSL_BIN:-openssl}
+STAT_BIN=${STAT_BIN:-stat}
+DIARCHY_HOST_BIN=${DIARCHY_HOST_BIN:-$HOME/.local/bin/diarchy-host}
+
+fail() {
+  printf '[fail] %s\n' "$*" >&2
+  exit 1
+}
+
+ok() {
+  printf '[ok] %s\n' "$*"
+}
+
+[[ -x $BIN ]] || fail "Lan Mouse binary is missing: $BIN"
+version=$("$BIN" --version 2>&1) || fail "Lan Mouse cannot report its version"
+[[ $version == *"lan-mouse $VERSION"* ]] || fail "expected lan-mouse $VERSION"
+ok "lan-mouse $VERSION"
+
+if [[ -f $DIARCHY_HOST_BIN && -x $DIARCHY_HOST_BIN ]]; then
+  agent_version=$("$DIARCHY_HOST_BIN" version 2>/dev/null) || agent_version=
+fi
+[[ ${agent_version:-} == *'"ok":true'* ]] \
+  || fail "diarchy-host agent is missing or unhealthy: $DIARCHY_HOST_BIN"
+ok "diarchy-host agent present"
+
+"$SYSTEMCTL_BIN" --user is-active --quiet graphical-session.target \
+  || fail "graphical-session.target is inactive"
+ok "graphical-session.target is active"
+"$SYSTEMCTL_BIN" --user is-active --quiet "$SERVICE" \
+  || fail "$SERVICE is inactive"
+ok "$SERVICE is active"
+
+[[ -f $CONFIG ]] || fail "configuration is missing: $CONFIG"
+mode=$("$STAT_BIN" -c '%a' "$CONFIG")
+[[ $mode == 600 ]] || fail "configuration mode is $mode, expected 600"
+grep -q '^port = 4242$' "$CONFIG" || fail "configuration does not select UDP $PORT"
+grep -q '^capture_backend = "layer-shell"$' "$CONFIG" \
+  || fail "host must use the portal-free layer-shell capture backend"
+grep -q '^\[authorized_fingerprints\]$' "$CONFIG" \
+  || fail "authorized_fingerprints section is missing"
+grep -Eq '^"([[:xdigit:]]{2}:){31}[[:xdigit:]]{2}" = "mac"$' "$CONFIG" \
+  || fail "trusted Mac fingerprint is missing"
+ok "trusted Mac fingerprint is configured"
+
+[[ -f $CERT ]] || fail "Lan Mouse certificate is missing: $CERT"
+fingerprint=$("$OPENSSL_BIN" x509 -in "$CERT" -noout -fingerprint -sha256 2>/dev/null) \
+  || fail "Lan Mouse certificate is invalid"
+[[ $fingerprint == *"Fingerprint="* ]] || fail "certificate fingerprint is unavailable"
+ok "Lan Mouse certificate is valid"
+
+"$SS_BIN" -H -lun | grep -Eq "(^|[[:space:]])[^[:space:]]*:${PORT}([[:space:]]|$)" \
+  || fail "UDP $PORT is not listening"
+ok "UDP $PORT is listening"
+
+printf '[ok] Diarchy KVM host is healthy\n'

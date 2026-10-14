@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Right-edge GTK drop portal for the host to Mac transfers."""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import struct
+import subprocess
+import threading
+from pathlib import Path
+from typing import BinaryIO
+from urllib.parse import unquote, urlsplit
+
+MAX_RECORD_BYTES = 65_536
+MAX_STAGE_ITEMS = 32
+MAX_DETAIL_CHARS = 1_024
+SOCKET_NAME = "diarchy-file-portal.sock"
+
+TRIGGER_WIDTH = 3
+REVEALED_WIDTH = 52
+EXPANDED_WIDTH = 72
+PORTAL_HEIGHT = 180
+EXPANDED_HEIGHT = 200
+HIDE_DELAY_MS = 500
+
+def _read_exact(stream: BinaryIO, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise EOFError("truncated portal response")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _encode_record(record: dict[str, object]) -> bytes:
+    payload = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not 0 < len(payload) <= MAX_RECORD_BYTES:
+        raise ValueError("invalid portal record length")
+    return struct.pack("!I", len(payload)) + payload
+
+
+def _decode_record(stream: BinaryIO) -> dict[str, object]:
+    length = struct.unpack("!I", _read_exact(stream, 4))[0]
+    if not 0 < length <= MAX_RECORD_BYTES:
+        raise ValueError("invalid portal record length")
+    try:
+        record = json.loads(_read_exact(stream, length).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid portal JSON") from exc
+    if not isinstance(record, dict) or record.get("type") not in {"queued", "error"}:
+        raise ValueError("invalid portal response type")
+    return record
+
+
+def parse_uri_list(raw: bytes) -> list[Path]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("URI list is not UTF-8") from exc
+    paths: list[Path] = []
+    for line in text.splitlines():
+        uri = line.strip()
+        if not uri or uri.startswith("#"):
+            continue
+        parsed = urlsplit(uri)
+        if parsed.scheme != "file":
+            raise ValueError(f"drop item is not a file URI: {uri}")
+        if parsed.netloc not in {"", "localhost"}:
+            raise ValueError(f"remote file URI is not supported: {uri}")
+        path = Path(unquote(parsed.path))
+        if not path.is_absolute():
+            raise ValueError(f"file URI path is not absolute: {uri}")
+        paths.append(path)
+    if not paths:
+        raise ValueError("drop contains no file URLs")
+    return paths
+
+
+def send_stage_request(paths: list[Path], socket_path: Path) -> dict[str, object]:
+    if not 0 < len(paths) <= MAX_STAGE_ITEMS:
+        raise ValueError(f"a drop must contain 1-{MAX_STAGE_ITEMS} items")
+    request = {"type": "stage", "paths": [str(path) for path in paths]}
+    try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(10)
+        connection.connect(str(socket_path))
+        connection.settimeout(None)
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
+        try:
+            connection.close()
+        except UnboundLocalError:
+            pass
+        raise ConnectionError("Mac receiver unavailable") from exc
+    with connection:
+        stream = connection.makefile("rwb", buffering=0)
+        stream.write(_encode_record(request))
+        response = _decode_record(stream)
+    if response.get("type") == "error":
+        raise RuntimeError(str(response.get("error", "Diarchy portal helper failed")))
+    return response
+
+
+def summarize_stage_response(response: dict[str, object]) -> tuple[str, str, bool]:
+    raw_items = response.get("items")
+    raw_errors = response.get("errors")
+    items = raw_items if isinstance(raw_items, list) else []
+    errors = raw_errors if isinstance(raw_errors, list) else []
+    queued_names = [
+        str(item.get("name"))
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ]
+    rejected: list[str] = []
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        path = error.get("path")
+        detail = error.get("error")
+        if isinstance(path, str) and isinstance(detail, str):
+            rejected.append(f"{path}: {detail}")
+    if rejected:
+        summary = "Transfer partly queued" if queued_names else "Transfer rejected"
+        fragments = []
+        if queued_names:
+            fragments.append("Queued " + ", ".join(queued_names))
+        first_rejection = rejected[0]
+        if len(rejected) > 1:
+            first_rejection += f" (+{len(rejected) - 1} more)"
+        fragments.append("Rejected " + first_rejection)
+        fragments.append(f"{len(queued_names)} queued; {len(rejected)} rejected")
+        return summary, ". ".join(fragments)[:MAX_DETAIL_CHARS], True
+    if queued_names:
+        return "Sending to Mac", ("Queued " + ", ".join(queued_names))[:MAX_DETAIL_CHARS], False
+    return "Transfer failed", "Portal helper returned no item results", True
+
+
+def portal_visual_mode(
+    *,
+    pointer_inside: bool,
+    drag_active: bool,
+    sending: bool,
+    available: bool,
+) -> str:
+    if not available:
+        return "unavailable"
+    if drag_active and not sending:
+        return "drag"
+    if pointer_inside or sending:
+        return "revealed"
+    return "edge"
+
+
+def portal_accepts_drop(*, sending: bool, available: bool) -> bool:
+    return available and not sending
+
+
+def _notify_text(value: str) -> str:
+    """Printable, markup-free text for a notification daemon that renders a subset of HTML."""
+    printable = "".join(ch for ch in str(value) if ch.isprintable())
+    return printable.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:500]
+
+
+def notify(summary: str, detail: str) -> None:
+    try:
+        subprocess.run(
+            ["notify-send", "--", "Diarchy file portal", _notify_text(summary), _notify_text(detail)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+
+def run_gui(socket_path: Path) -> int:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("Gdk", "3.0")
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import Gdk, GLib, Gtk, GtkLayerShell
+
+    class PortalWindow(Gtk.Window):
+        def __init__(self) -> None:
+            super().__init__(title="Diarchy File Portal")
+            self.pointer_inside = False
+            self.drag_active = False
+            self.sending = False
+            self.hide_generation = 0
+            self.transfer_generation = 0
+            self.set_name("file-portal")
+            self.set_decorated(False)
+            self.set_resizable(False)
+            self.set_size_request(TRIGGER_WIDTH, PORTAL_HEIGHT)
+            self.label = Gtk.Label(label="DROP\nTO\nMAC")
+            self.label.set_justify(Gtk.Justification.CENTER)
+            self.add(self.label)
+            self.label.hide()
+
+            GtkLayerShell.init_for_window(self)
+            GtkLayerShell.set_layer(self, GtkLayerShell.Layer.TOP)
+            GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
+            GtkLayerShell.set_exclusive_zone(self, 0)
+            GtkLayerShell.set_keyboard_interactivity(self, False)
+
+            self.add_events(
+                Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            )
+            self.connect("enter-notify-event", self.on_pointer_enter)
+            self.connect("leave-notify-event", self.on_pointer_leave)
+            targets = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
+            self.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
+            self.connect("drag-motion", self.on_drag_motion)
+            self.connect("drag-leave", self.on_drag_leave)
+            self.connect("drag-data-received", self.on_drag_data_received)
+
+            css = Gtk.CssProvider()
+            css.load_from_data(
+                b"#file-portal { background: transparent; border: 0; }"
+                b"#file-portal.revealed { background: rgba(23, 27, 38, 0.94); border: 2px solid #7dd3fc; border-radius: 12px 0 0 12px; }"
+                b"#file-portal.drag-active { background: rgba(14, 116, 144, 0.98); border-color: #e0f2fe; }"
+                b"#file-portal label { color: #f8fafc; font-weight: 700; font-size: 12px; padding: 10px; }"
+            )
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+            GLib.timeout_add(350, self.sync_visibility)
+            self.sync_visibility()
+
+        def apply_visual_mode(self, mode: str) -> None:
+            context = self.get_style_context()
+            if mode in {"unavailable", "edge"}:
+                context.remove_class("drag-active")
+                context.remove_class("revealed")
+                self.set_size_request(TRIGGER_WIDTH, PORTAL_HEIGHT)
+                self.label.hide()
+            elif mode == "drag":
+                context.add_class("revealed")
+                context.add_class("drag-active")
+                self.set_size_request(EXPANDED_WIDTH, EXPANDED_HEIGHT)
+                self.label.show()
+            else:
+                context.add_class("revealed")
+                context.remove_class("drag-active")
+                self.set_size_request(REVEALED_WIDTH, PORTAL_HEIGHT)
+                self.label.show()
+            self.queue_resize()
+
+        def reset_to_unavailable(self) -> None:
+            self.pointer_inside = False
+            self.drag_active = False
+            self.sending = False
+            self.hide_generation += 1
+            self.transfer_generation += 1
+            self.label.set_text("DROP\nTO\nMAC")
+            self.apply_visual_mode(
+                portal_visual_mode(
+                    pointer_inside=self.pointer_inside,
+                    drag_active=self.drag_active,
+                    sending=self.sending,
+                    available=False,
+                )
+            )
+            self.hide()
+
+        def sync_visibility(self) -> bool:
+            available = socket_path.exists() and socket_path.is_socket()
+            if not available:
+                if self.get_visible() or self.pointer_inside or self.drag_active or self.sending:
+                    self.reset_to_unavailable()
+                return True
+            if not self.get_visible():
+                self.pointer_inside = False
+                self.drag_active = False
+                self.sending = False
+                self.show_all()
+                self.apply_visual_mode(
+                    portal_visual_mode(
+                        pointer_inside=False,
+                        drag_active=False,
+                        sending=False,
+                        available=True,
+                    )
+                )
+            return True
+
+        def reveal(self, expanded: bool) -> None:
+            self.hide_generation += 1
+            self.apply_visual_mode("drag" if expanded else "revealed")
+
+        def collapse_to_edge(self) -> bool:
+            mode = portal_visual_mode(
+                pointer_inside=self.pointer_inside,
+                drag_active=self.drag_active,
+                sending=self.sending,
+                available=True,
+            )
+            if mode != "edge":
+                return False
+            self.apply_visual_mode(mode)
+            return False
+
+        def schedule_hide(self) -> None:
+            self.hide_generation += 1
+            generation = self.hide_generation
+
+            def collapse_if_current() -> bool:
+                if generation != self.hide_generation:
+                    return False
+                return self.collapse_to_edge()
+
+            GLib.timeout_add(HIDE_DELAY_MS, collapse_if_current)
+
+        def on_pointer_enter(self, _widget: object, _event: object) -> bool:
+            self.pointer_inside = True
+            self.label.set_text("DROP\nTO\nMAC")
+            self.reveal(expanded=False)
+            return False
+
+        def on_pointer_leave(self, _widget: object, _event: object) -> bool:
+            self.pointer_inside = False
+            self.schedule_hide()
+            return False
+
+        def set_drag_active(self, active: bool) -> None:
+            self.drag_active = active
+            if active:
+                self.label.set_text("RELEASE\nTO SEND")
+                self.reveal(expanded=True)
+                return
+            self.get_style_context().remove_class("drag-active")
+            self.label.set_text("DROP\nTO\nMAC")
+            if self.pointer_inside or self.sending:
+                self.reveal(expanded=False)
+            else:
+                self.schedule_hide()
+
+        def on_drag_motion(self, _widget: object, context: object, _x: int, _y: int, time: int) -> bool:
+            available = socket_path.exists() and socket_path.is_socket()
+            if not portal_accepts_drop(sending=self.sending, available=available):
+                Gdk.drag_status(context, Gdk.DragAction(0), time)
+                return False
+            self.set_drag_active(True)
+            Gdk.drag_status(context, Gdk.DragAction.COPY, time)
+            return True
+
+        def on_drag_leave(self, _widget: object, _context: object, _time: int) -> None:
+            self.set_drag_active(False)
+
+        def on_drag_data_received(
+            self,
+            _widget: object,
+            context: object,
+            _x: int,
+            _y: int,
+            selection_data: object,
+            _info: int,
+            time: int,
+        ) -> None:
+            available = socket_path.exists() and socket_path.is_socket()
+            if not portal_accepts_drop(sending=self.sending, available=available):
+                Gtk.drag_finish(context, False, False, time)
+                return
+            self.set_drag_active(False)
+            try:
+                paths = parse_uri_list(bytes(selection_data.get_data()))
+            except (TypeError, ValueError) as exc:
+                self.report("Transfer rejected", str(exc), error=True)
+                Gtk.drag_finish(context, False, False, time)
+                return
+            self.sending = True
+            self.transfer_generation += 1
+            generation = self.transfer_generation
+            self.reveal(expanded=False)
+            self.label.set_text(f"SENDING\n{len(paths)} ITEM" + ("S" if len(paths) != 1 else ""))
+            Gtk.drag_finish(context, True, False, time)
+            threading.Thread(
+                target=self.submit,
+                args=(paths, generation),
+                daemon=True,
+            ).start()
+
+        def submit(self, paths: list[Path], generation: int) -> None:
+            try:
+                response = send_stage_request(paths, socket_path)
+                summary, detail, error = summarize_stage_response(response)
+                GLib.idle_add(self.report, summary, detail, error, generation)
+            except (ConnectionError, EOFError, OSError, RuntimeError, ValueError) as exc:
+                GLib.idle_add(self.report, "Transfer failed", str(exc), True, generation)
+
+        def report(
+            self,
+            summary: str,
+            detail: str,
+            error: bool = False,
+            generation: int | None = None,
+        ) -> bool:
+            if generation is not None and generation != self.transfer_generation:
+                return False
+            if generation is None:
+                self.transfer_generation += 1
+                generation = self.transfer_generation
+            self.sending = True
+            self.reveal(expanded=False)
+            self.label.set_text("FAILED" if error else "SENDING")
+            notify(summary, detail)
+            GLib.timeout_add(2500, self.reset_label, generation)
+            return False
+
+        def reset_label(self, generation: int) -> bool:
+            if generation != self.transfer_generation:
+                return False
+            self.sending = False
+            self.label.set_text("DROP\nTO\nMAC")
+            if self.pointer_inside:
+                self.reveal(expanded=False)
+            else:
+                self.schedule_hide()
+            return False
+
+    window = PortalWindow()
+    window.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+def main() -> int:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_dir:
+        print("XDG_RUNTIME_DIR is not set", file=os.sys.stderr)
+        return 2
+    return run_gui(Path(runtime_dir) / SOCKET_NAME)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

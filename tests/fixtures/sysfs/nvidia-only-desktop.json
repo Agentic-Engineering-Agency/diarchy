@@ -1,0 +1,40 @@
+{
+  "source": "synthetic",
+  "cards": [
+    {
+      "card": "card0",
+      "pci": "0000:01:00.0",
+      "vendor": "0x10de",
+      "device": "0x2504",
+      "driver": "nvidia",
+      "render": "renderD128",
+      "boot_vga": true,
+      "connectors": [
+        "DP-1",
+        "HDMI-A-1"
+      ]
+    }
+  ],
+  "expect": {
+    "DP-1": [
+      "/dev/dri/renderD128",
+      "nvidia",
+      "nvenc"
+    ],
+    "HDMI-A-1": [
+      "/dev/dri/renderD128",
+      "nvidia",
+      "nvenc"
+    ],
+    "DIARCHY": [
+      "/dev/dri/renderD128",
+      "nvidia",
+      "nvenc"
+    ],
+    "null": [
+      "/dev/dri/renderD128",
+      "nvidia",
+      "nvenc"
+    ]
+  }
+}

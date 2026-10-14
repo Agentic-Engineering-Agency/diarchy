@@ -1,0 +1,40 @@
+{
+  "source": "https://github.com/linuxhw/LsPCI (GT 710 on nouveau, driver facts only)",
+  "cards": [
+    {
+      "card": "card0",
+      "pci": "0000:01:00.0",
+      "vendor": "0x10de",
+      "device": "0x128b",
+      "driver": "nouveau",
+      "render": "renderD128",
+      "boot_vga": true,
+      "connectors": [
+        "DVI-D-1",
+        "HDMI-A-1"
+      ]
+    }
+  ],
+  "expect": {
+    "DVI-D-1": [
+      "/dev/dri/renderD128",
+      "nouveau",
+      null
+    ],
+    "HDMI-A-1": [
+      "/dev/dri/renderD128",
+      "nouveau",
+      null
+    ],
+    "DIARCHY": [
+      "/dev/dri/renderD128",
+      "nouveau",
+      null
+    ],
+    "null": [
+      "/dev/dri/renderD128",
+      "nouveau",
+      null
+    ]
+  }
+}

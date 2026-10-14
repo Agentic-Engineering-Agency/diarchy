@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HYPRCTL_BIN=${HYPRCTL_BIN:-hyprctl}
+JQ_BIN=${JQ_BIN:-jq}
+TARGET_DIR=$HOME/.local/opt/sunshine-2026.516.143833
+LIBVA_PATH=${DIARCHY_LIBVA_PATH:-/usr/lib/libva.so.2}
+LIBVA_DRM_PATH=${DIARCHY_LIBVA_DRM_PATH:-/usr/lib/libva-drm.so.2}
+LIBVA_DRIVERS_DIR=${DIARCHY_LIBVA_DRIVERS_DIR:-/usr/lib/dri}
+
+no_session() {
+  printf 'sunshine: no Hyprland session is running for this user\n' >&2
+  exit 1
+}
+
+instances=$("$HYPRCTL_BIN" instances -j) || no_session
+instance=$(
+  printf '%s\n' "$instances" |
+    "$JQ_BIN" -cer '
+      map(select(
+        (.pid // 0) > 0
+        and (.instance // "") != ""
+        and (.wl_socket // "") != ""
+      ))
+      | sort_by(.time // 0)
+      | last
+    ' 2>/dev/null
+) || no_session
+export HYPRLAND_INSTANCE_SIGNATURE
+HYPRLAND_INSTANCE_SIGNATURE=$(
+  printf '%s\n' "$instance" | "$JQ_BIN" -er '.instance'
+)
+export WAYLAND_DISPLAY
+WAYLAND_DISPLAY=$(
+  printf '%s\n' "$instance" | "$JQ_BIN" -er '.wl_socket'
+)
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+
+DISPLAY_BIN=${DIARCHY_DISPLAY_BIN:-$HOME/.local/bin/diarchy-display}
+
+# Sunshine 2026.516.143833 reads `output_name` in two places. The startup probe (wlgrab init) matches it against the
+# Wayland output names first and only then as an index. Each client session (video.cpp refresh_displays) compares it
+# with the output names only. An index pin therefore splits them: the probe takes monitor N, the session takes the
+# first monitor. The output name matches in both. Runs after `diarchy-display reconcile`, so the headless output
+# exists when it is the selected one. Only a conf with the managed header is touched.
+pin_output() {
+  local conf=$1 selected monitors tmp
+  [[ -f $conf ]] && head -n 1 "$conf" | grep -q '^# Managed by diarchy' || return 0
+  selected=$("$DISPLAY_BIN" status | head -n 1) || {
+    printf 'Cannot read the selected output from diarchy-display\n' >&2
+    return 1
+  }
+  monitors=$("$HYPRCTL_BIN" -j monitors all) || {
+    printf 'Cannot list the monitors with hyprctl\n' >&2
+    return 1
+  }
+  if [[ ! $selected =~ ^[A-Za-z0-9._-]{1,64}$ ]] ||
+    ! printf '%s\n' "$monitors" | "$JQ_BIN" -e --arg output "$selected" '
+      any(.[]; .name == $output and ((.disabled // false) | not))' >/dev/null; then
+    printf 'The selected output %s is not an enabled monitor. Sunshine did not start.\n' "$selected" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$conf.XXXXXX")
+  {
+    grep -Ev '^[[:space:]]*output_name[[:space:]]*=' "$conf" || [[ $? -eq 1 ]]
+    printf 'output_name = %s\n' "$selected"
+  } >"$tmp" && chmod 600 "$tmp" && mv "$tmp" "$conf" || {
+    rm -f "$tmp"
+    printf 'Cannot write %s\n' "$conf" >&2
+    return 1
+  }
+}
+
+if [[ $# -ge 1 ]]; then
+  pin_output "$1"
+fi
+
+# The AppImage bundles libva 1.x, which cannot load the host's current VA-API drivers (iHD, radeonsi, ...): when the
+# host has its own libva, run Sunshine on it so `encoder = vaapi` works.
+if [[ -f $LIBVA_PATH && -f $LIBVA_DRM_PATH ]]; then
+  export LD_PRELOAD=$LIBVA_PATH:$LIBVA_DRM_PATH${LD_PRELOAD:+:$LD_PRELOAD}
+  if [[ -d $LIBVA_DRIVERS_DIR ]]; then
+    export LIBVA_DRIVERS_PATH=${LIBVA_DRIVERS_PATH:-$LIBVA_DRIVERS_DIR}
+  fi
+fi
+
+# The session may name one driver for every GPU (Omarchy exports LIBVA_DRIVER_NAME=nvidia for the NVIDIA card), which
+# libva would then try on the Intel/AMD render node and fail. Without it libva picks the driver of the adapter device;
+# DIARCHY_LIBVA_DRIVER_NAME forces one explicitly.
+unset LIBVA_DRIVER_NAME
+if [[ -n ${DIARCHY_LIBVA_DRIVER_NAME:-} ]]; then
+  export LIBVA_DRIVER_NAME=$DIARCHY_LIBVA_DRIVER_NAME
+fi
+
+exec "$TARGET_DIR/AppRun" "$@"

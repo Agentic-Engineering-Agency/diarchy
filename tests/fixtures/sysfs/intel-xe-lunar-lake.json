@@ -1,0 +1,40 @@
+{
+  "source": "synthetic",
+  "cards": [
+    {
+      "card": "card0",
+      "pci": "0000:00:02.0",
+      "vendor": "0x8086",
+      "device": "0x64a0",
+      "driver": "xe",
+      "render": "renderD128",
+      "boot_vga": true,
+      "connectors": [
+        "DP-1",
+        "eDP-1"
+      ]
+    }
+  ],
+  "expect": {
+    "eDP-1": [
+      "/dev/dri/renderD128",
+      "xe",
+      "vaapi"
+    ],
+    "DP-1": [
+      "/dev/dri/renderD128",
+      "xe",
+      "vaapi"
+    ],
+    "DIARCHY": [
+      "/dev/dri/renderD128",
+      "xe",
+      "vaapi"
+    ],
+    "null": [
+      "/dev/dri/renderD128",
+      "xe",
+      "vaapi"
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+[Unit]
+Description=Sunshine host for Diarchy
+Documentation=https://docs.lizardbyte.dev/projects/sunshine/latest/
+After=graphical-session.target diarchy-display.service
+Requires=diarchy-display.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=%h/.local/bin/diarchy-display reconcile
+ExecStart=%h/.local/bin/sunshine %h/.config/sunshine/sunshine.conf
+Restart=on-failure
+NoNewPrivileges=yes
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

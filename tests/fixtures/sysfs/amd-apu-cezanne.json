@@ -1,0 +1,40 @@
+{
+  "source": "synthetic",
+  "cards": [
+    {
+      "card": "card0",
+      "pci": "0000:06:00.0",
+      "vendor": "0x1002",
+      "device": "0x1638",
+      "driver": "amdgpu",
+      "render": "renderD128",
+      "boot_vga": true,
+      "connectors": [
+        "HDMI-A-1",
+        "eDP-1"
+      ]
+    }
+  ],
+  "expect": {
+    "eDP-1": [
+      "/dev/dri/renderD128",
+      "amdgpu",
+      "vaapi"
+    ],
+    "HDMI-A-1": [
+      "/dev/dri/renderD128",
+      "amdgpu",
+      "vaapi"
+    ],
+    "DIARCHY": [
+      "/dev/dri/renderD128",
+      "amdgpu",
+      "vaapi"
+    ],
+    "null": [
+      "/dev/dri/renderD128",
+      "amdgpu",
+      "vaapi"
+    ]
+  }
+}

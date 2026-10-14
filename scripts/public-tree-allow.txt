@@ -1,0 +1,7 @@
+# Fake test tokens accepted by scripts/check-public-tree. One literal per line.
+# Never add a real value here.
+/Users/a
+/Users/nina
+/home/test
+tail1234.ts.net
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA

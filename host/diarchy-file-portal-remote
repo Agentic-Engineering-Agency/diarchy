@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""Stage Diarchy file-portal drops for a Mac-initiated receiver."""
+
+from __future__ import annotations
+
+import ctypes
+import errno
+import json
+import os
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import uuid
+from pathlib import Path
+from typing import BinaryIO, Collection
+
+MAX_RECORD_BYTES = 65_536
+MAX_STAGE_ITEMS = 32
+MAX_ERROR_CHARS = 512
+COPY_CHUNK_BYTES = 1024 * 1024
+OUTBOX = Path.home() / "Drop" / "to-mac"
+SOCKET_NAME = "diarchy-file-portal.sock"
+
+
+def _read_exact(stream: BinaryIO, size: int, *, clean_eof: bool = False) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            if clean_eof and not chunks:
+                return None
+            raise EOFError("truncated portal record")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def encode_record(record: dict[str, object]) -> bytes:
+    payload = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not 0 < len(payload) <= MAX_RECORD_BYTES:
+        raise ValueError("invalid portal record length")
+    return struct.pack("!I", len(payload)) + payload
+
+
+def decode_record(
+    stream: BinaryIO, allowed_types: Collection[str]
+) -> dict[str, object] | None:
+    header = _read_exact(stream, 4, clean_eof=True)
+    if header is None:
+        return None
+    length = struct.unpack("!I", header)[0]
+    if not 0 < length <= MAX_RECORD_BYTES:
+        raise ValueError("invalid portal record length")
+    payload = _read_exact(stream, length)
+    assert payload is not None
+    try:
+        record = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid portal JSON") from exc
+    if not isinstance(record, dict):
+        raise ValueError("portal JSON must be an object")
+    if record.get("type") not in allowed_types:
+        raise ValueError("invalid portal record type")
+    return record
+
+
+def validate_drop_path(path: Path) -> tuple[str, str]:
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError("drop path must be absolute")
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as exc:
+        raise ValueError(f"drop path does not exist: {path}") from exc
+    if stat.S_ISLNK(mode):
+        raise ValueError(f"drop path is a symlink: {path}")
+    name = path.name
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("drop path has an invalid basename")
+    if stat.S_ISREG(mode):
+        return name, "file"
+    if stat.S_ISDIR(mode):
+        return name, "directory"
+    raise ValueError(f"drop path is not a regular file or directory: {path}")
+
+
+def _stable_open(parent_fd: int, name: str, expected: os.stat_result, flags: int) -> int:
+    descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent_fd)
+    actual = os.fstat(descriptor)
+    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        os.close(descriptor)
+        raise ValueError(f"source changed while opening: {name}")
+    return descriptor
+
+
+def _ensure_unchanged(before: os.stat_result, after: os.stat_result, display: str) -> None:
+    before_fields = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_fields = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_fields != after_fields:
+        raise ValueError(f"source changed during staging: {display}")
+
+
+def _copy_file_descriptor(
+    source_fd: int,
+    destination_parent_fd: int,
+    destination_name: str,
+    metadata: os.stat_result,
+    display: str,
+) -> None:
+    destination_fd = os.open(
+        destination_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=destination_parent_fd,
+    )
+    try:
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(source_fd, min(COPY_CHUNK_BYTES, remaining))
+            if not chunk:
+                raise ValueError(f"source shrank during staging: {display}")
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(destination_fd, view) :]
+            remaining -= len(chunk)
+        if os.read(source_fd, 1):
+            raise ValueError(f"source grew during staging: {display}")
+        _ensure_unchanged(metadata, os.fstat(source_fd), display)
+        os.utime(destination_fd, ns=(metadata.st_mtime_ns, metadata.st_mtime_ns))
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+
+
+def _copy_directory_descriptor(
+    source_fd: int,
+    destination_fd: int,
+    metadata: os.stat_result,
+    display: str,
+) -> None:
+    for name in sorted(os.listdir(source_fd)):
+        child = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        child_display = f"{display}/{name}"
+        if stat.S_ISREG(child.st_mode):
+            child_source_fd = _stable_open(source_fd, name, child, os.O_RDONLY)
+            try:
+                _copy_file_descriptor(
+                    child_source_fd,
+                    destination_fd,
+                    name,
+                    child,
+                    child_display,
+                )
+            finally:
+                os.close(child_source_fd)
+        elif stat.S_ISDIR(child.st_mode):
+            child_source_fd = _stable_open(
+                source_fd,
+                name,
+                child,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            os.mkdir(name, mode=0o700, dir_fd=destination_fd)
+            child_destination_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=destination_fd,
+            )
+            try:
+                _copy_directory_descriptor(
+                    child_source_fd,
+                    child_destination_fd,
+                    child,
+                    child_display,
+                )
+            finally:
+                os.close(child_destination_fd)
+                os.close(child_source_fd)
+        else:
+            raise ValueError(f"directory contains a symlink or special file: {child_display}")
+    _ensure_unchanged(metadata, os.fstat(source_fd), display)
+    os.utime(destination_fd, ns=(metadata.st_mtime_ns, metadata.st_mtime_ns))
+    os.fsync(destination_fd)
+
+
+def _publish_no_replace(staged: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renamex_np = getattr(libc, "renamex_np", None)
+    if renamex_np is not None:
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(staged), os.fsencode(destination), 4)
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), destination)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(-100, os.fsencode(staged), -100, os.fsencode(destination), 1)
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        if error not in {errno.ENOSYS, errno.EINVAL}:
+            raise OSError(error, os.strerror(error), destination)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination)
+    if staged.is_file():
+        os.link(staged, destination)
+        staged.unlink()
+    else:
+        raise OSError(errno.ENOTSUP, "atomic no-replace directory rename is unavailable", destination)
+
+
+def stage_path(source: Path, outbox: Path, request_id: str) -> Path:
+    source = Path(source)
+    if not source.is_absolute():
+        raise ValueError("drop path must be absolute")
+    if not source.name or source.name in {".", ".."} or "/" in source.name:
+        raise ValueError("drop path has an invalid basename")
+    safe_id = "".join(character for character in request_id if character.isalnum() or character in "-_")
+    if not safe_id:
+        raise ValueError("request ID is invalid")
+
+    source_parent_fd = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        metadata = os.stat(source.name, dir_fd=source_parent_fd, follow_symlinks=False)
+        if stat.S_ISREG(metadata.st_mode):
+            kind = "file"
+            source_fd = _stable_open(source_parent_fd, source.name, metadata, os.O_RDONLY)
+        elif stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+            source_fd = _stable_open(
+                source_parent_fd,
+                source.name,
+                metadata,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+        else:
+            raise ValueError(f"drop path is a symlink or special file: {source}")
+    except FileNotFoundError as exc:
+        raise ValueError(f"drop path does not exist: {source}") from exc
+    finally:
+        os.close(source_parent_fd)
+
+    outbox = Path(outbox)
+    outbox.mkdir(mode=0o700, parents=True, exist_ok=True)
+    outbox_mode = outbox.lstat().st_mode
+    if not stat.S_ISDIR(outbox_mode) or stat.S_ISLNK(outbox_mode):
+        os.close(source_fd)
+        raise ValueError(f"unsafe portal outbox: {outbox}")
+    os.chmod(outbox, 0o700)
+    outbox_fd = os.open(outbox, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary_name = f".portal-stage-{safe_id}"
+    destination = outbox / source.name
+    temporary = outbox / temporary_name
+    try:
+        try:
+            os.stat(source.name, dir_fd=outbox_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination)
+        if kind == "file":
+            _copy_file_descriptor(source_fd, outbox_fd, temporary_name, metadata, source.name)
+        else:
+            os.mkdir(temporary_name, mode=0o700, dir_fd=outbox_fd)
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=outbox_fd,
+            )
+            try:
+                _copy_directory_descriptor(source_fd, temporary_fd, metadata, source.name)
+            finally:
+                os.close(temporary_fd)
+        _publish_no_replace(temporary, destination)
+    except BaseException:
+        if temporary.is_dir() and not temporary.is_symlink():
+            shutil.rmtree(temporary, ignore_errors=True)
+        else:
+            temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(outbox_fd)
+        os.close(source_fd)
+    return destination
+
+
+def complete_staged(staged: Path, status: str) -> None:
+    if status != "ok":
+        return
+    staged = Path(staged)
+    if staged.is_dir() and not staged.is_symlink():
+        shutil.rmtree(staged)
+    else:
+        staged.unlink(missing_ok=True)
+
+
+def _item_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(child.stat().st_size for child in path.rglob("*") if child.is_file())
+
+
+def _notify_text(value: str) -> str:
+    """Printable, markup-free text for a notification daemon that renders a subset of HTML."""
+    printable = "".join(ch for ch in str(value) if ch.isprintable())
+    return printable.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:500]
+
+
+def _notify(summary: str, detail: str) -> None:
+    try:
+        subprocess.run(
+            ["notify-send", "--", "Diarchy file portal", _notify_text(summary), _notify_text(detail)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
+
+
+class PortalRemote:
+    def __init__(self, socket_path: Path, outbox: Path = OUTBOX) -> None:
+        self.socket_path = socket_path
+        self.outbox = outbox
+        self.pending: dict[str, Path] = {}
+        self.pending_lock = threading.Lock()
+        self.output_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.server: socket.socket | None = None
+        self.handler_lock = threading.Lock()
+        self.handlers: set[threading.Thread] = set()
+        self.handler_connections: set[socket.socket] = set()
+
+    def emit(self, record: dict[str, object]) -> None:
+        payload = encode_record(record)
+        with self.output_lock:
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+
+    def _stage_request(self, record: dict[str, object]) -> dict[str, object]:
+        paths = record.get("paths")
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or len(paths) > MAX_STAGE_ITEMS
+            or not all(isinstance(path, str) and path for path in paths)
+        ):
+            raise ValueError(f"stage request paths must contain 1-{MAX_STAGE_ITEMS} strings")
+        queued: list[dict[str, object]] = []
+        errors: list[dict[str, str]] = []
+        for raw_path in paths:
+            request_id = uuid.uuid4().hex
+            try:
+                staged = stage_path(Path(raw_path), self.outbox, request_id)
+                _, kind = validate_drop_path(staged)
+                metadata: dict[str, object] = {
+                    "type": "ready",
+                    "id": request_id,
+                    "name": staged.name,
+                    "kind": kind,
+                    "size": _item_size(staged),
+                    "mtime": int(staged.stat().st_mtime),
+                }
+                with self.pending_lock:
+                    self.pending[request_id] = staged
+                self.emit(metadata)
+                queued.append({key: value for key, value in metadata.items() if key != "type"})
+            except (OSError, ValueError) as exc:
+                label = Path(raw_path).name or "<unnamed>"
+                errors.append(
+                    {
+                        "path": label[:255],
+                        "error": str(exc).replace("\n", " ")[:MAX_ERROR_CHARS],
+                    }
+                )
+        return {"type": "queued", "items": queued, "errors": errors}
+
+    def _handle_client(self, connection: socket.socket) -> None:
+        with connection:
+            stream = connection.makefile("rwb", buffering=0)
+            try:
+                record = decode_record(stream, {"stage"})
+                if record is None:
+                    return
+                response = self._stage_request(record)
+            except (EOFError, OSError, ValueError) as exc:
+                response = {"type": "error", "error": str(exc)}
+            try:
+                stream.write(encode_record(response))
+            except OSError:
+                pass
+
+    def _run_handler(self, connection: socket.socket) -> None:
+        try:
+            self._handle_client(connection)
+        finally:
+            with self.handler_lock:
+                self.handlers.discard(threading.current_thread())
+                self.handler_connections.discard(connection)
+
+    def _start_handler(self, connection: socket.socket) -> None:
+        handler = threading.Thread(target=self._run_handler, args=(connection,))
+        with self.handler_lock:
+            self.handlers.add(handler)
+            self.handler_connections.add(connection)
+        try:
+            handler.start()
+        except BaseException:
+            with self.handler_lock:
+                self.handlers.discard(handler)
+                self.handler_connections.discard(connection)
+            connection.close()
+            raise
+
+    def join_handlers(self) -> None:
+        while True:
+            with self.handler_lock:
+                handlers = list(self.handlers)
+            if not handlers:
+                return
+            for handler in handlers:
+                handler.join()
+
+    def stop_handlers(self) -> None:
+        with self.handler_lock:
+            connections = list(self.handler_connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.join_handlers()
+
+    def _prepare_socket(self) -> socket.socket:
+        self.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.socket_path.exists() or self.socket_path.is_symlink():
+            existing = self.socket_path.lstat()
+            if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.getuid():
+                raise RuntimeError(f"refusing unsafe existing socket: {self.socket_path}")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(self.socket_path))
+            except ConnectionRefusedError:
+                self.socket_path.unlink()
+            else:
+                raise RuntimeError("another file portal receiver is active")
+            finally:
+                probe.close()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(self.socket_path))
+        os.chmod(self.socket_path, 0o600)
+        server.listen(4)
+        server.settimeout(0.5)
+        self.server = server
+        return server
+
+    def serve_socket(self) -> None:
+        server = self._prepare_socket()
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    connection, _ = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self.stop_event.is_set():
+                        break
+                    raise
+                self._start_handler(connection)
+        finally:
+            server.close()
+            if self.socket_path.exists() or self.socket_path.is_symlink():
+                self.socket_path.unlink()
+
+    def handle_ack(self, record: dict[str, object]) -> None:
+        request_id = record.get("id")
+        status = record.get("status")
+        if not isinstance(request_id, str) or status not in {"ok", "failed"}:
+            raise ValueError("ack requires an ID and ok/failed status")
+        with self.pending_lock:
+            staged = self.pending.pop(request_id, None)
+        if staged is None:
+            raise ValueError("ack references an unknown request")
+        complete_staged(staged, status)
+        if status == "ok":
+            _notify("Transfer complete", staged.name)
+        else:
+            error = record.get("error")
+            detail = str(error) if error else f"Staged copy retained at {staged}"
+            _notify("Transfer failed", detail)
+
+    def notify_pending_disconnect(self) -> None:
+        with self.pending_lock:
+            retained = list(self.pending.values())
+        if not retained:
+            return
+        names = ", ".join(path.name for path in retained[:8])
+        if len(retained) > 8:
+            names += f", and {len(retained) - 8} more"
+        _notify(
+            "Mac receiver disconnected",
+            f"Retained {len(retained)} staged item(s): {names}",
+        )
+
+    def run(self) -> int:
+        socket_thread = threading.Thread(target=self.serve_socket, daemon=True)
+        socket_thread.start()
+        while socket_thread.is_alive() and self.server is None:
+            socket_thread.join(0.01)
+        if not socket_thread.is_alive():
+            return 1
+        self.emit({"type": "session", "status": "ready"})
+        try:
+            while True:
+                record = decode_record(sys.stdin.buffer, {"ack"})
+                if record is None:
+                    return 0
+                self.handle_ack(record)
+        except (EOFError, OSError, ValueError) as exc:
+            try:
+                self.emit({"type": "error", "error": str(exc)})
+            except (BrokenPipeError, OSError):
+                pass
+            return 1
+        finally:
+            self.stop_event.set()
+            if self.server is not None:
+                self.server.close()
+            socket_thread.join()
+            self.stop_handlers()
+            self.notify_pending_disconnect()
+
+
+def main() -> int:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime_dir:
+        print("XDG_RUNTIME_DIR is not set", file=sys.stderr)
+        return 2
+    remote = PortalRemote(Path(runtime_dir) / SOCKET_NAME)
+
+    def stop(_signum: int, _frame: object) -> None:
+        remote.stop_event.set()
+        if remote.server is not None:
+            remote.server.close()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    return remote.run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

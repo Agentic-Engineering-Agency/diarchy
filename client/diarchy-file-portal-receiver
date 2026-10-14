@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""Own the SSH portal session and pull staged host drops to the Mac."""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import shutil
+from pathlib import Path
+from typing import BinaryIO, Callable, Sequence
+
+MAX_RECORD_BYTES = 65_536
+MAX_ERROR_CHARS = 1_024
+# Largest item the Mac accepts from the host, and the free space kept after a pull.
+MAX_ITEM_BYTES = 2 * 1024**3
+FREE_SPACE_RESERVE_BYTES = 512 * 1024**2
+_ACTIVE_GET_CHILD: subprocess.Popen[str] | None = None
+_ACTIVE_SSH_CHILD: subprocess.Popen[bytes] | None = None
+_ACTIVE_CHILD_LOCK = threading.RLock()
+_STOP_REQUESTED = threading.Event()
+
+
+def _signal_process_group(child: subprocess.Popen[object], sig: signal.Signals) -> None:
+    if child.poll() is not None:
+        return
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _request_stop(*_ignored: object) -> None:
+    _STOP_REQUESTED.set()
+    with _ACTIVE_CHILD_LOCK:
+        children = (_ACTIVE_GET_CHILD, _ACTIVE_SSH_CHILD)
+    for child in children:
+        if child is not None:
+            _signal_process_group(child, signal.SIGTERM)
+
+
+def _run_get(argv: Sequence[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    global _ACTIVE_GET_CHILD
+    child = subprocess.Popen(
+        list(argv),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    with _ACTIVE_CHILD_LOCK:
+        _ACTIVE_GET_CHILD = child
+    stop_deadline: float | None = None
+    try:
+        while True:
+            try:
+                stdout, stderr = child.communicate(timeout=0.25)
+                return subprocess.CompletedProcess(list(argv), child.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                if _STOP_REQUESTED.is_set():
+                    if stop_deadline is None:
+                        stop_deadline = time.monotonic() + 5
+                        _signal_process_group(child, signal.SIGTERM)
+                    elif time.monotonic() >= stop_deadline:
+                        _signal_process_group(child, signal.SIGKILL)
+    finally:
+        with _ACTIVE_CHILD_LOCK:
+            if _ACTIVE_GET_CHILD is child:
+                _ACTIVE_GET_CHILD = None
+
+
+def _wait_for_child(child: subprocess.Popen[object], escalate: bool = False) -> None:
+    stop_deadline: float | None = None
+    while True:
+        try:
+            child.wait(timeout=0.25)
+            return
+        except subprocess.TimeoutExpired:
+            if escalate or _STOP_REQUESTED.is_set():
+                if stop_deadline is None:
+                    stop_deadline = time.monotonic() + 5
+                    _signal_process_group(child, signal.SIGTERM)
+                elif time.monotonic() >= stop_deadline:
+                    _signal_process_group(child, signal.SIGKILL)
+
+
+def _read_exact(stream: BinaryIO, size: int, *, clean_eof: bool = False) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            if clean_eof and not chunks:
+                return None
+            raise EOFError("truncated portal record")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def encode_record(record: dict[str, object]) -> bytes:
+    payload = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not 0 < len(payload) <= MAX_RECORD_BYTES:
+        raise ValueError("invalid portal record length")
+    return struct.pack("!I", len(payload)) + payload
+
+
+def decode_record(stream: BinaryIO, allowed_types: set[str]) -> dict[str, object] | None:
+    header = _read_exact(stream, 4, clean_eof=True)
+    if header is None:
+        return None
+    length = struct.unpack("!I", header)[0]
+    if not 0 < length <= MAX_RECORD_BYTES:
+        raise ValueError("invalid portal record length")
+    payload = _read_exact(stream, length)
+    assert payload is not None
+    try:
+        record = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid portal JSON") from exc
+    if not isinstance(record, dict) or record.get("type") not in allowed_types:
+        raise ValueError("invalid portal record type")
+    return record
+
+
+def _free_bytes() -> int:
+    path = Path.home() / "Drop" / "from-host"
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return shutil.disk_usage(path).free
+
+
+def _validate_ready(record: dict[str, object]) -> tuple[str, str, int]:
+    request_id = record.get("id")
+    name = record.get("name")
+    kind = record.get("kind")
+    size = record.get("size")
+    mtime = record.get("mtime")
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        raise ValueError("ready record has an invalid ID")
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+    ):
+        raise ValueError("ready record has an invalid basename")
+    if kind not in {"file", "directory"}:
+        raise ValueError("ready record has an invalid kind")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise ValueError("ready record has an invalid size")
+    if not isinstance(mtime, int) or isinstance(mtime, bool) or mtime < 0:
+        raise ValueError("ready record has an invalid mtime")
+    return request_id, name, size
+
+
+def process_records(
+    remote_stdout: BinaryIO,
+    remote_stdin: BinaryIO,
+    get_command: Sequence[str],
+    runner: Callable[..., object] | None = None,
+    free_bytes: Callable[[], int] = _free_bytes,
+) -> int:
+    seen_ids: set[str] = set()
+    aggregate = 0
+    while True:
+        record = decode_record(remote_stdout, {"ready", "error"})
+        if record is None:
+            return aggregate
+        if record["type"] == "error":
+            raise RuntimeError(str(record.get("error", "remote portal helper failed")))
+        request_id, name, size = _validate_ready(record)
+        if request_id in seen_ids:
+            raise ValueError("duplicate portal request ID")
+        seen_ids.add(request_id)
+        refusal: str | None = None
+        if size > MAX_ITEM_BYTES:
+            refusal = "item is larger than the size limit"
+        elif size + FREE_SPACE_RESERVE_BYTES > free_bytes():
+            refusal = "not enough free space on the Mac"
+        if refusal is not None:
+            aggregate = 1
+            remote_stdin.write(
+                encode_record({"type": "ack", "id": request_id, "status": "failed", "error": refusal})
+            )
+            remote_stdin.flush()
+            continue
+        execute = runner or _run_get
+        completed = execute(
+            [*get_command, "get", "--", name],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        returncode = int(getattr(completed, "returncode"))
+        stdout = str(getattr(completed, "stdout", ""))
+        stderr = str(getattr(completed, "stderr", ""))
+        ok = returncode == 0 and "status=ok" in stdout
+        ack: dict[str, object] = {
+            "type": "ack",
+            "id": request_id,
+            "status": "ok" if ok else "failed",
+        }
+        if not ok:
+            aggregate = 1
+            detail = (stdout.strip() + ("; " if stdout.strip() and stderr.strip() else "") + stderr.strip())
+            ack["error"] = (detail or f"diarchy-file exited {returncode}")[:MAX_ERROR_CHARS]
+        remote_stdin.write(encode_record(ack))
+        remote_stdin.flush()
+
+
+def mark_ready(ready_file: Path | None) -> None:
+    if ready_file is None:
+        return
+    ready_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(
+        ready_file,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.write(descriptor, b"ready\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def clear_ready(ready_file: Path | None) -> None:
+    if ready_file is None:
+        return
+    try:
+        ready_file.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def await_session(remote_stdout: BinaryIO, ready_file: Path | None) -> None:
+    session = decode_record(remote_stdout, {"session", "error"})
+    if session is None:
+        raise EOFError("remote helper exited before session readiness")
+    if session["type"] == "error":
+        raise RuntimeError(str(session.get("error", "remote portal helper failed"))[:MAX_ERROR_CHARS])
+    if session.get("status") != "ready":
+        raise ValueError("invalid portal session readiness")
+    mark_ready(ready_file)
+
+
+def receiver_session(
+    ssh_argv: Sequence[str],
+    get_command: Sequence[str],
+    stdin: BinaryIO | None = None,
+    stdout: BinaryIO | None = None,
+    ready_file: Path | None = None,
+    runner: Callable[..., object] | None = None,
+) -> int:
+    if stdin is not None and stdout is not None:
+        try:
+            await_session(stdin, ready_file)
+            return process_records(stdin, stdout, get_command, runner)
+        finally:
+            clear_ready(ready_file)
+    global _ACTIVE_SSH_CHILD
+    child = subprocess.Popen(
+        list(ssh_argv),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    with _ACTIVE_CHILD_LOCK:
+        _ACTIVE_SSH_CHILD = child
+    assert child.stdin is not None and child.stdout is not None
+    previous_term = signal.signal(signal.SIGTERM, _request_stop)
+    previous_int = signal.signal(signal.SIGINT, _request_stop)
+    try:
+        await_session(child.stdout, ready_file)
+        result = process_records(child.stdout, child.stdin, get_command, runner)
+        child.stdin.close()
+        _wait_for_child(child)
+        if child.returncode not in {0, None}:
+            return 1
+        return result
+    except (BrokenPipeError, EOFError, OSError, RuntimeError, ValueError) as exc:
+        print(f"diarchy-file-portal-receiver: {exc}", file=sys.stderr)
+        _signal_process_group(child, signal.SIGTERM)
+        _wait_for_child(child, escalate=True)
+        return 1
+    finally:
+        clear_ready(ready_file)
+        with _ACTIVE_CHILD_LOCK:
+            if _ACTIVE_SSH_CHILD is child:
+                _ACTIVE_SSH_CHILD = None
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
+
+def _resolve_ssh_argv(route_script: Path) -> list[str]:
+    bash = """
+set -euo pipefail
+source "$1"
+select_diarchy_route auto
+printf '%s\\0' "$DIARCHY_SSH_ALIAS" "${diarchy_ssh_options[@]}"
+"""
+    raw = subprocess.check_output(
+        ["/bin/bash", "-c", bash, "diarchy-file-portal-receiver", str(route_script)]
+    )
+    parts = [os.fsdecode(part) for part in raw.split(b"\0") if part]
+    if not parts:
+        raise RuntimeError("route selection returned no SSH target")
+    alias, *options = parts
+    return [
+        os.environ.get("SSH_BIN", "ssh"),
+        *options,
+        alias,
+        "~/.local/bin/diarchy-file-portal-remote",
+    ]
+
+
+def supervise(
+    run_once: Callable[[], int],
+    stop: threading.Event,
+    sleep: Callable[[float], object] | None = None,
+    now: Callable[[], float] = time.monotonic,
+    base: float = 1.0,
+    cap: float = 30.0,
+    healthy: float = 60.0,
+) -> int:
+    """Run `run_once` again after every exit, with a doubling pause (capped); a session that lived at least
+    `healthy` seconds resets the pause. Returns the last exit code once `stop` is set."""
+    wait = sleep if sleep is not None else stop.wait
+    delay = base
+    while True:
+        started = now()
+        code = run_once()
+        if stop.is_set():
+            return code
+        if now() - started >= healthy:
+            delay = base
+        wait(delay)
+        if stop.is_set():
+            return code
+        delay = min(delay * 2, cap)
+
+
+RECEIVER_USAGE = "usage: diarchy-file-portal-receiver [--help]"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments in (["--help"], ["-h"]):
+        print(RECEIVER_USAGE)
+        return 0
+    if arguments:
+        print(RECEIVER_USAGE, file=sys.stderr)
+        return 2
+    script_dir = Path(__file__).resolve().parent
+    route_script = Path(os.environ.get("DIARCHY_FILE_ROUTE_SH", script_dir / "diarchy-route.sh"))
+    get_command = [os.environ.get("DIARCHY_FILE_BIN", str(script_dir / "diarchy-file"))]
+    ready_value = os.environ.get("DIARCHY_FILE_PORTAL_READY_FILE")
+    ready_file = Path(ready_value) if ready_value else None
+
+    def run_once() -> int:
+        # The route is chosen again on every start: after sleep or a network change it can differ.
+        try:
+            ssh_argv = _resolve_ssh_argv(route_script)
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+            print(f"diarchy-file-portal-receiver: {exc}", file=sys.stderr)
+            return 1
+        return receiver_session(ssh_argv, get_command, ready_file=ready_file)
+
+    signal.signal(signal.SIGTERM, _request_stop)
+    signal.signal(signal.SIGINT, _request_stop)
+    return supervise(run_once, _STOP_REQUESTED)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

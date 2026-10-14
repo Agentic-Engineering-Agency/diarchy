@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag must match host/VERSION
+        run: test "${TAG#v}" = "$(tr -d '[:space:]' < host/VERSION)"
+      - name: Build the ad-hoc signed app
+        run: app/scripts/build-app.sh
+      - name: Zip and checksum
+        run: |
+          set -euo pipefail
+          mkdir dist
+          ditto -c -k --keepParent app/build/Diarchy.app "dist/Diarchy-${TAG}.zip"
+          cd dist
+          shasum -a 256 "Diarchy-${TAG}.zip" > SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+      - name: Create the draft release
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" "dist/Diarchy-${TAG}.zip" dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes --title "Diarchy ${TAG}"

@@ -1,0 +1,84 @@
+{
+  "schema_version": "eval.config.v1",
+  "name": "Clipboard and file transfer smoke suite",
+  "cases": [
+    {
+      "schema_version": "eval.case.v1",
+      "case_id": "clipboard-runtime-artifacts",
+      "title": "Clipboard runtime and tests exist",
+      "suite": "smoke",
+      "risk_tier": "critical",
+      "task_type": "repository_smoke",
+      "source": {"kind": "spec", "path": "docs/superpowers/specs/2026-07-29-clipboard-file-transfer-design.md"},
+      "privacy": {"classification": "public", "sanitized": true},
+      "expected": {"success_criteria": ["Both clipboard pumps and their deterministic test module exist."]},
+      "judge": {"type": "deterministic", "assertions": [
+        {"type": "file_exists", "path": "client/diarchy-clipboard-bridge"},
+        {"type": "file_exists", "path": "host/diarchy-clipboard-remote"},
+        {"type": "file_exists", "path": "tests/test_clipboard_bridge.py"}
+      ]}
+    },
+    {
+      "schema_version": "eval.case.v1",
+      "case_id": "file-transfer-runtime-artifacts",
+      "title": "File transfer and route artifacts exist",
+      "suite": "smoke",
+      "risk_tier": "critical",
+      "task_type": "repository_smoke",
+      "source": {"kind": "spec", "path": "docs/superpowers/specs/2026-07-29-clipboard-file-transfer-design.md"},
+      "privacy": {"classification": "public", "sanitized": true},
+      "expected": {"success_criteria": ["The route library, transfer CLI, and their deterministic tests exist."]},
+      "judge": {"type": "deterministic", "assertions": [
+        {"type": "file_exists", "path": "client/diarchy-route.sh"},
+        {"type": "file_exists", "path": "client/diarchy-file"},
+        {"type": "file_exists", "path": "tests/test_route_selection.py"},
+        {"type": "file_exists", "path": "tests/test_file_transfer.py"}
+      ]}
+    },
+    {
+      "schema_version": "eval.case.v1",
+      "case_id": "sharing-integration-artifacts",
+      "title": "Installers doctors drop app and KVM tests exist",
+      "suite": "smoke",
+      "risk_tier": "critical",
+      "task_type": "repository_smoke",
+      "source": {"kind": "spec", "path": "docs/superpowers/specs/2026-07-29-clipboard-file-transfer-design.md"},
+      "privacy": {"classification": "public", "sanitized": true},
+      "expected": {"success_criteria": ["Both installers and doctors, the drop app source, and integration tests exist."]},
+      "judge": {"type": "deterministic", "assertions": [
+        {"type": "file_exists", "path": "client/install-clipboard-file-transfer.sh"},
+        {"type": "file_exists", "path": "host/install-clipboard-file-transfer.sh"},
+        {"type": "file_exists", "path": "client/diarchy-clipboard-file-transfer-client-doctor"},
+        {"type": "file_exists", "path": "host/diarchy-file-transfer-host-doctor"},
+        {"type": "file_exists", "path": "client/Diarchy Drop.applescript"},
+        {"type": "file_exists", "path": "tests/test_clipboard_file_transfer_install.py"},
+        {"type": "file_exists", "path": "tests/test_diarchy_kvm_hook.py"}
+      ]}
+    },
+    {
+      "schema_version": "eval.case.v1",
+      "case_id": "edge-file-portal-artifacts",
+      "title": "Edge file portal runtime service and tests exist",
+      "suite": "smoke",
+      "risk_tier": "critical",
+      "task_type": "repository_smoke",
+      "source": {"kind": "spec", "path": "docs/superpowers/specs/2026-07-29-clipboard-file-transfer-design.md"},
+      "privacy": {"classification": "public", "sanitized": true},
+      "expected": {"success_criteria": ["The Mac and the host portal runtimes, owned service unit, and deterministic test modules exist."]},
+      "judge": {"type": "deterministic", "assertions": [
+        {"type": "file_exists", "path": "client/Diarchy File Portal.swift"},
+        {"type": "file_exists", "path": "client/diarchy-file-portal-send"},
+        {"type": "file_exists", "path": "client/diarchy-file-portal-receiver"},
+        {"type": "file_exists", "path": "host/diarchy-file-portal"},
+        {"type": "file_exists", "path": "host/diarchy-file-portal-remote"},
+        {"type": "file_exists", "path": "host/diarchy-file-portal-ingest"},
+        {"type": "file_exists", "path": "host/systemd/diarchy-file-portal.service"},
+        {"type": "file_exists", "path": "tests/test_mac_file_portal.py"},
+        {"type": "file_exists", "path": "tests/test_file_portal_send.py"},
+        {"type": "file_exists", "path": "tests/test_file_portal_receiver.py"},
+        {"type": "file_exists", "path": "tests/test_file_portal_protocol.py"},
+        {"type": "file_exists", "path": "tests/test_host_file_portal.py"}
+      ]}
+    }
+  ]
+}

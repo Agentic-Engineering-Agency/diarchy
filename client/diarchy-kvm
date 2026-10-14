@@ -1,0 +1,568 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+LAN_MOUSE_APP=${LAN_MOUSE_APP:-$HOME/Applications/Lan Mouse.app}
+EXECUTABLE=$LAN_MOUSE_APP/Contents/MacOS/lan-mouse
+PGREP_BIN=${PGREP_BIN:-/usr/bin/pgrep}
+OPEN_BIN=${OPEN_BIN:-/usr/bin/open}
+PKILL_BIN=${PKILL_BIN:-/usr/bin/pkill}
+SLEEP_BIN=${SLEEP_BIN:-/bin/sleep}
+PS_BIN=${PS_BIN:-/bin/ps}
+KILL_BIN=${KILL_BIN:-/bin/kill}
+NOHUP_BIN=${NOHUP_BIN:-/usr/bin/nohup}
+CLIPBOARD_BRIDGE_BIN=${CLIPBOARD_BRIDGE_BIN:-$HOME/.local/bin/diarchy-clipboard-bridge}
+CLIPBOARD_BRIDGE_IDENTITY=diarchy-clipboard-bridge-runtime-v1
+RUNTIME_BASE=${TMPDIR:-$HOME/Library/Caches}
+CLIPBOARD_RUNTIME_DIR=$RUNTIME_BASE/diarchy-clipboard-bridge-$(id -u)
+CLIPBOARD_RUNTIME_LOCK=$RUNTIME_BASE/diarchy-clipboard-bridge-$(id -u).lock
+CLIPBOARD_DEBUG_LOG=$RUNTIME_BASE/diarchy-clipboard-bridge-debug-$(id -u).log
+FILE_PORTAL_APP=${FILE_PORTAL_APP:-$HOME/Applications/Diarchy File Portal.app}
+FILE_PORTAL_EXECUTABLE=$FILE_PORTAL_APP/Contents/MacOS/diarchy-file-portal
+FILE_PORTAL_RECEIVER_BIN=${FILE_PORTAL_RECEIVER_BIN:-$HOME/.local/bin/diarchy-file-portal-receiver}
+FILE_PORTAL_SENDER_BIN=${FILE_PORTAL_SENDER_BIN:-$HOME/.local/bin/diarchy-file-portal-send}
+FILE_PORTAL_RUNTIME_DIR=${FILE_PORTAL_RUNTIME_DIR:-$RUNTIME_BASE/diarchy-file-portal-$(id -u)}
+KVM_ACTION_LOCK_DIR=${KVM_ACTION_LOCK_DIR:-$RUNTIME_BASE/diarchy-kvm-action-$(id -u).lock}
+KVM_ACTION_LOCK_TAKEN=0
+KVM_ACTION_SIGNAL=0
+
+fail() {
+  printf 'diarchy-kvm: %s\n' "$*" >&2
+  exit 1
+}
+
+# Create a private runtime directory. Refuse a symlink or a directory that
+# another user owns, so a local attacker cannot pre-create it.
+ensure_runtime_dir() {
+  local dir=$1
+  [[ ! -L $dir ]] || return 1
+  mkdir -p -- "$(dirname -- "$dir")" || return 1
+  [[ -d $dir ]] || mkdir -m 700 -- "$dir" || return 1
+  [[ -d $dir && -O $dir ]]
+}
+
+release_action_lock() {
+  if (( KVM_ACTION_LOCK_TAKEN )); then
+    rm -f -- "$KVM_ACTION_LOCK_DIR/pid" >/dev/null 2>&1 || true
+    rmdir -- "$KVM_ACTION_LOCK_DIR" >/dev/null 2>&1 || true
+    KVM_ACTION_LOCK_TAKEN=0
+  fi
+}
+
+acquire_action_lock() {
+  local owner
+  for _ in {1..100}; do
+    if mkdir -p -- "$(dirname -- "$KVM_ACTION_LOCK_DIR")" && [[ ! -L $KVM_ACTION_LOCK_DIR ]] && mkdir -m 700 -- "$KVM_ACTION_LOCK_DIR" 2>/dev/null; then
+      KVM_ACTION_LOCK_TAKEN=1
+      trap release_action_lock EXIT
+      trap 'KVM_ACTION_SIGNAL=130' INT
+      trap 'KVM_ACTION_SIGNAL=143' TERM
+      printf '%s\n' "$$" >"$KVM_ACTION_LOCK_DIR/pid"
+      return 0
+    fi
+    if [[ -f $KVM_ACTION_LOCK_DIR/pid ]]; then
+      IFS= read -r owner <"$KVM_ACTION_LOCK_DIR/pid" || owner=
+      if [[ $owner =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$owner" >/dev/null 2>&1; then
+        rm -f -- "$KVM_ACTION_LOCK_DIR/pid" >/dev/null 2>&1 || true
+        rmdir -- "$KVM_ACTION_LOCK_DIR" >/dev/null 2>&1 || true
+        continue
+      fi
+    elif [[ -d $KVM_ACTION_LOCK_DIR && ! -L $KVM_ACTION_LOCK_DIR ]]; then
+      # A kill between mkdir and the pid write leaves a lock without a pid file. Give a live owner 30 s to write it.
+      local modified
+      modified=$(/usr/bin/stat -f %m -- "$KVM_ACTION_LOCK_DIR" 2>/dev/null) || modified=
+      if [[ $modified =~ ^[0-9]+$ ]] && (( $(date +%s) - modified > 30 )); then
+        rmdir -- "$KVM_ACTION_LOCK_DIR" >/dev/null 2>&1 || true
+        continue
+      fi
+    fi
+    "$SLEEP_BIN" 0.1
+  done
+  return 1
+}
+
+run_locked() {
+  local result=0
+  acquire_action_lock || fail "another KVM action is in progress"
+  "$@" || result=$?
+  release_action_lock
+  trap - EXIT INT TERM
+  if (( KVM_ACTION_SIGNAL != 0 )); then
+    return "$KVM_ACTION_SIGNAL"
+  fi
+  return "$result"
+}
+
+# pgrep and pkill read the pattern as an extended regular expression; a home path can hold `+`, `(` or `[`.
+regex_escape() {
+  printf '%s' "$1" | /usr/bin/sed -E 's/[][\\.*+?(){}|^$]/\\&/g'
+}
+EXECUTABLE_PATTERN=$(regex_escape "$EXECUTABLE")
+
+is_running() {
+  "$PGREP_BIN" -f -x "$EXECUTABLE_PATTERN" >/dev/null 2>&1 \
+    || "$PGREP_BIN" -f -x "$EXECUTABLE_PATTERN daemon" >/dev/null 2>&1
+}
+
+clipboard_bridge_command() {
+  if [[ $CLIPBOARD_BRIDGE_BIN == */* ]]; then
+    [[ -x $CLIPBOARD_BRIDGE_BIN ]] || return 1
+    printf '%s\n' "$CLIPBOARD_BRIDGE_BIN"
+    return 0
+  fi
+  command -v -- "$CLIPBOARD_BRIDGE_BIN" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$CLIPBOARD_BRIDGE_BIN"
+}
+
+clipboard_pid_file_present() {
+  [[ -e $CLIPBOARD_RUNTIME_DIR/pid ]]
+}
+
+clipboard_pid() {
+  local pid_file=$CLIPBOARD_RUNTIME_DIR/pid
+  [[ -f $pid_file ]] || return 1
+  IFS= read -r clipboard_pid_value <"$pid_file" || return 1
+  [[ $clipboard_pid_value =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$clipboard_pid_value"
+}
+
+clipboard_pid_is_verified() {
+  local pid=$1 command
+  command=$("$PS_BIN" -p "$pid" -o command= 2>/dev/null || true)
+  [[ -n $command ]] || return 1
+  [[ " $command " == *" --$CLIPBOARD_BRIDGE_IDENTITY "* ]]
+}
+
+clipboard_cleanup_runtime() {
+  rm -f -- "$CLIPBOARD_RUNTIME_DIR/pid" "$CLIPBOARD_RUNTIME_DIR/status" >/dev/null 2>&1 || true
+  rmdir -- "$CLIPBOARD_RUNTIME_DIR" >/dev/null 2>&1 || true
+  [[ -e $CLIPBOARD_RUNTIME_LOCK ]] || true
+}
+
+clipboard_status() {
+  local pid marker
+  if ! clipboard_bridge_command >/dev/null; then
+    printf 'absent\n'
+    return 0
+  fi
+  marker=$CLIPBOARD_RUNTIME_DIR/status
+  if [[ -f $marker ]] && grep -qx 'crashed' "$marker" 2>/dev/null; then
+    printf 'crashed\n'
+    return 0
+  fi
+  if ! pid=$(clipboard_pid); then
+    if clipboard_pid_file_present; then
+      printf 'crashed\n'
+    else
+      printf 'off\n'
+    fi
+    return 0
+  fi
+  if clipboard_pid_is_verified "$pid"; then
+    printf 'on\n'
+    return 0
+  fi
+  printf 'crashed\n'
+}
+
+clipboard_mark_crashed() {
+  ensure_runtime_dir "$CLIPBOARD_RUNTIME_DIR" || return 1
+  printf 'crashed\n' >"$CLIPBOARD_RUNTIME_DIR/status"
+}
+
+clipboard_start() {
+  local bridge pid state
+  bridge=$(clipboard_bridge_command) || return 1
+  state=$(clipboard_status)
+  case "$state" in
+    on) return 0 ;;
+    crashed)
+      if pid=$(clipboard_pid) && clipboard_pid_is_verified "$pid"; then
+        return 1
+      fi
+      clipboard_cleanup_runtime
+      ;;
+    absent) return 1 ;;
+  esac
+  if [[ ${DIARCHY_CLIPBOARD_DEBUG:-0} == 1 ]]; then
+    DIARCHY_CLIPBOARD_DEBUG_LOG=$CLIPBOARD_DEBUG_LOG "$NOHUP_BIN" "$bridge" >/dev/null 2>/dev/null &
+  else
+    "$NOHUP_BIN" "$bridge" >/dev/null 2>&1 &
+  fi
+  for _ in {1..150}; do
+    [[ $(clipboard_status) == on ]] && return 0
+    "$SLEEP_BIN" 0.1
+  done
+  clipboard_mark_crashed
+  return 1
+}
+
+clipboard_stop() {
+  local pid state
+  state=$(clipboard_status)
+  case "$state" in
+    absent|off) return 0 ;;
+    crashed)
+      if ! pid=$(clipboard_pid) || ! clipboard_pid_is_verified "$pid"; then
+        clipboard_cleanup_runtime
+        return 0
+      fi
+      ;;
+    on)
+      pid=$(clipboard_pid) || { clipboard_cleanup_runtime; return 0; }
+      clipboard_pid_is_verified "$pid" || { clipboard_cleanup_runtime; return 0; }
+      ;;
+  esac
+  "$KILL_BIN" -TERM "$pid" >/dev/null 2>&1 || true
+  for _ in {1..20}; do
+    if ! clipboard_pid_is_verified "$pid"; then
+      clipboard_cleanup_runtime
+      return 0
+    fi
+    "$SLEEP_BIN" 0.1
+  done
+  clipboard_pid_is_verified "$pid" && "$KILL_BIN" -KILL "$pid" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    if ! clipboard_pid_is_verified "$pid"; then
+      clipboard_cleanup_runtime
+      return 0
+    fi
+    "$SLEEP_BIN" 0.1
+  done
+  if clipboard_pid_is_verified "$pid"; then
+    clipboard_mark_crashed
+  else
+    clipboard_cleanup_runtime
+  fi
+}
+
+file_portal_receiver_command() {
+  if [[ $FILE_PORTAL_RECEIVER_BIN == */* ]]; then
+    [[ -x $FILE_PORTAL_RECEIVER_BIN ]] || return 1
+    printf '%s\n' "$FILE_PORTAL_RECEIVER_BIN"
+    return 0
+  fi
+  command -v -- "$FILE_PORTAL_RECEIVER_BIN" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$FILE_PORTAL_RECEIVER_BIN"
+}
+
+file_portals_installed() {
+  [[ -x $FILE_PORTAL_EXECUTABLE && -x $FILE_PORTAL_SENDER_BIN ]] || return 1
+  file_portal_receiver_command >/dev/null
+}
+
+file_portal_pid_file() {
+  case $1 in
+    receiver) printf '%s\n' "$FILE_PORTAL_RUNTIME_DIR/receiver.pid" ;;
+    app) printf '%s\n' "$FILE_PORTAL_RUNTIME_DIR/app.pid" ;;
+    *) return 1 ;;
+  esac
+}
+
+file_portal_pid() {
+  local component=$1 pid_file pid_value
+  pid_file=$(file_portal_pid_file "$component") || return 1
+  [[ -f $pid_file ]] || return 1
+  IFS= read -r pid_value <"$pid_file" || return 1
+  [[ $pid_value =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$pid_value"
+}
+
+file_portal_pid_file_present() {
+  local pid_file
+  pid_file=$(file_portal_pid_file "$1") || return 1
+  [[ -e $pid_file ]]
+}
+
+file_portal_expected_command() {
+  case $1 in
+    receiver) printf '%s\n' "$FILE_PORTAL_RECEIVER_BIN" ;;
+    app) printf '%s\n' "$FILE_PORTAL_EXECUTABLE" ;;
+    *) return 1 ;;
+  esac
+}
+
+file_portal_pid_is_verified() {
+  local component=$1 pid=$2 expected command interpreter
+  expected=$(file_portal_expected_command "$component") || return 1
+  command=$("$PS_BIN" -p "$pid" -o command= 2>/dev/null || true)
+  [[ -n $command ]] || return 1
+  if [[ $component == app ]]; then
+    [[ $command == "$expected" ]]
+    return
+  fi
+  [[ $command == "$expected" ]] && return 0
+  [[ $command == *" $expected" ]] || return 1
+  interpreter=${command%" $expected"}
+  [[ -n $interpreter && $interpreter != *[[:space:]]* ]]
+}
+
+file_portal_cleanup_runtime() {
+  local component=$1 pid_file status_file
+  pid_file=$(file_portal_pid_file "$component") || return 0
+  status_file=$FILE_PORTAL_RUNTIME_DIR/$component.status
+  rm -f -- "$pid_file" "$status_file" >/dev/null 2>&1 || true
+  [[ $component != receiver ]] || rm -f -- "$FILE_PORTAL_RUNTIME_DIR/receiver.ready" >/dev/null 2>&1 || true
+  rmdir -- "$FILE_PORTAL_RUNTIME_DIR" >/dev/null 2>&1 || true
+}
+
+file_portal_mark_crashed() {
+  local component=$1
+  ensure_runtime_dir "$FILE_PORTAL_RUNTIME_DIR" || return 1
+  printf 'crashed\n' >"$FILE_PORTAL_RUNTIME_DIR/$component.status"
+}
+
+file_portal_component_status() {
+  local component=$1 pid marker
+  marker=$FILE_PORTAL_RUNTIME_DIR/$component.status
+  if [[ -f $marker ]] && grep -qx 'crashed' "$marker" 2>/dev/null; then
+    printf 'crashed\n'
+    return 0
+  fi
+  if pid=$(file_portal_pid "$component"); then
+    if file_portal_pid_is_verified "$component" "$pid"; then
+      if [[ $component != receiver || -f $FILE_PORTAL_RUNTIME_DIR/receiver.ready ]]; then
+        printf 'on\n'
+      else
+        printf 'crashed\n'
+      fi
+    else
+      printf 'crashed\n'
+    fi
+    return 0
+  fi
+  if file_portal_pid_file_present "$component"; then
+    printf 'crashed\n'
+  elif file_portals_installed; then
+    printf 'off\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+file_portals_status() {
+  local receiver_state app_state
+  receiver_state=$(file_portal_component_status receiver)
+  app_state=$(file_portal_component_status app)
+  if [[ $receiver_state == on && $app_state == on ]]; then
+    printf 'on\n'
+  elif [[ $receiver_state == off && $app_state == off ]]; then
+    printf 'off\n'
+  elif [[ $receiver_state == absent && $app_state == absent ]]; then
+    printf 'absent\n'
+  else
+    printf 'crashed\n'
+  fi
+}
+
+file_portal_record_app_pid() {
+  local pid
+  IFS= read -r pid < <("$PGREP_BIN" -f -x "$(regex_escape "$FILE_PORTAL_EXECUTABLE")" 2>/dev/null) || return 1
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  ensure_runtime_dir "$FILE_PORTAL_RUNTIME_DIR" || return 1
+  printf '%s\n' "$pid" >"$(file_portal_pid_file app)"
+}
+
+file_portal_start_receiver() {
+  local receiver state pid_file ready_file
+  file_portals_installed || return 1
+  state=$(file_portal_component_status receiver)
+  case "$state" in
+    on) return 0 ;;
+    crashed) file_portal_stop_component receiver ;;
+  esac
+  receiver=$(file_portal_receiver_command) || return 1
+  ensure_runtime_dir "$FILE_PORTAL_RUNTIME_DIR" || return 1
+  pid_file=$(file_portal_pid_file receiver)
+  ready_file=$FILE_PORTAL_RUNTIME_DIR/receiver.ready
+  rm -f -- "$ready_file"
+  DIARCHY_FILE_PORTAL_READY_FILE=$ready_file "$NOHUP_BIN" "$receiver" >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$pid_file"
+  for _ in {1..100}; do
+    [[ $(file_portal_component_status receiver) == on ]] && return 0
+    "$SLEEP_BIN" 0.1
+  done
+  file_portal_mark_crashed receiver
+  return 1
+}
+
+file_portal_start_app() {
+  local state
+  file_portals_installed || return 1
+  state=$(file_portal_component_status app)
+  case "$state" in
+    on) return 0 ;;
+    crashed) file_portal_stop_component app ;;
+  esac
+  "$OPEN_BIN" -g "$FILE_PORTAL_APP"
+  for _ in {1..50}; do
+    file_portal_record_app_pid >/dev/null 2>&1 || true
+    [[ $(file_portal_component_status app) == on ]] && return 0
+    "$SLEEP_BIN" 0.1
+  done
+  file_portal_mark_crashed app
+  return 1
+}
+
+file_portal_stop_component() {
+  local component=$1 state pid
+  state=$(file_portal_component_status "$component")
+  case "$state" in
+    absent|off) return 0 ;;
+    crashed)
+      if ! pid=$(file_portal_pid "$component") || ! file_portal_pid_is_verified "$component" "$pid"; then
+        file_portal_cleanup_runtime "$component"
+        return 0
+      fi
+      ;;
+    on)
+      pid=$(file_portal_pid "$component") || { file_portal_cleanup_runtime "$component"; return 0; }
+      file_portal_pid_is_verified "$component" "$pid" || { file_portal_cleanup_runtime "$component"; return 0; }
+      ;;
+  esac
+  "$KILL_BIN" -TERM "$pid" >/dev/null 2>&1 || true
+  for _ in {1..20}; do
+    if ! file_portal_pid_is_verified "$component" "$pid"; then
+      file_portal_cleanup_runtime "$component"
+      return 0
+    fi
+    "$SLEEP_BIN" 0.1
+  done
+  file_portal_pid_is_verified "$component" "$pid" && "$KILL_BIN" -KILL "$pid" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    if ! file_portal_pid_is_verified "$component" "$pid"; then
+      file_portal_cleanup_runtime "$component"
+      return 0
+    fi
+    "$SLEEP_BIN" 0.1
+  done
+  if file_portal_pid_is_verified "$component" "$pid"; then
+    file_portal_mark_crashed "$component"
+  else
+    file_portal_cleanup_runtime "$component"
+  fi
+}
+
+file_portals_stop() {
+  file_portal_stop_component receiver
+  file_portal_stop_component app
+}
+
+status() {
+  local kvm_status bridge_status portals_status
+  bridge_status=$(clipboard_status)
+  portals_status=$(file_portals_status)
+  if is_running && [[ $bridge_status == on && $portals_status == on ]]; then
+    printf 'Diarchy KVM: enabled (clipboard bridge: %s, file portals: %s)\n' "$bridge_status" "$portals_status"
+    return 0
+  fi
+  if is_running || [[ $bridge_status != off && $bridge_status != absent ]] || [[ $portals_status != off && $portals_status != absent ]]; then
+    kvm_status=degraded
+  else
+    kvm_status=disabled
+  fi
+  printf 'Diarchy KVM: %s (clipboard bridge: %s, file portals: %s)\n' "$kvm_status" "$bridge_status" "$portals_status"
+  return 1
+}
+
+stop_lan_mouse() {
+  if ! is_running; then
+    return 0
+  fi
+  "$PKILL_BIN" -TERM -f -x "$EXECUTABLE_PATTERN" >/dev/null 2>&1 || true
+  "$PKILL_BIN" -TERM -f -x "$EXECUTABLE_PATTERN daemon" >/dev/null 2>&1 || true
+  for _ in {1..30}; do
+    is_running || return 0
+    "$SLEEP_BIN" 0.1
+  done
+  "$PKILL_BIN" -KILL -f -x "$EXECUTABLE_PATTERN" >/dev/null 2>&1 || true
+  "$PKILL_BIN" -KILL -f -x "$EXECUTABLE_PATTERN daemon" >/dev/null 2>&1 || true
+  for _ in {1..10}; do
+    is_running || return 0
+    "$SLEEP_BIN" 0.1
+  done
+  ! is_running
+}
+
+rollback_started_components() {
+  local started_lan=$1 started_clipboard=$2 started_receiver=$3 started_app=$4
+  [[ $started_receiver == 1 ]] && file_portal_stop_component receiver
+  [[ $started_app == 1 ]] && file_portal_stop_component app
+  [[ $started_clipboard == 1 ]] && clipboard_stop
+  if [[ $started_lan == 1 ]]; then
+    stop_lan_mouse || true
+  fi
+}
+
+turn_on() {
+  local started_lan=0 started_clipboard=0 started_receiver=0 started_app=0 initial_clipboard initial_receiver initial_app
+  [[ -x $EXECUTABLE ]] || fail "Lan Mouse is not installed at $LAN_MOUSE_APP"
+  clipboard_bridge_command >/dev/null || fail "clipboard bridge is not installed"
+  file_portals_installed || fail "file portals are not installed"
+  initial_clipboard=$(clipboard_status)
+  initial_receiver=$(file_portal_component_status receiver)
+  initial_app=$(file_portal_component_status app)
+  if ! is_running; then
+    "$OPEN_BIN" -gj "$LAN_MOUSE_APP"
+    started_lan=1
+    for _ in {1..30}; do
+      is_running && break
+      "$SLEEP_BIN" 0.1
+    done
+    is_running || fail "Lan Mouse did not remain running"
+  fi
+  [[ $initial_clipboard == on ]] || started_clipboard=1
+  if ! clipboard_start; then
+    rollback_started_components "$started_lan" "$started_clipboard" "$started_receiver" "$started_app"
+    fail "clipboard bridge did not remain running"
+  fi
+  [[ $initial_receiver == on ]] || started_receiver=1
+  if ! file_portal_start_receiver; then
+    rollback_started_components "$started_lan" "$started_clipboard" "$started_receiver" "$started_app"
+    fail "file portal receiver did not become ready"
+  fi
+  [[ $initial_app == on ]] || started_app=1
+  if ! file_portal_start_app; then
+    rollback_started_components "$started_lan" "$started_clipboard" "$started_receiver" "$started_app"
+    fail "file portal app did not remain running"
+  fi
+  if [[ $(clipboard_status) != on || $(file_portals_status) != on ]]; then
+    rollback_started_components "$started_lan" "$started_clipboard" "$started_receiver" "$started_app"
+    fail "KVM components did not remain running"
+  fi
+  if [[ $started_lan == 1 ]]; then
+    printf 'Diarchy KVM: enabled\n'
+  else
+    printf 'Diarchy KVM: already enabled\n'
+  fi
+}
+
+turn_off() {
+  file_portals_stop
+  clipboard_stop
+  if ! is_running; then
+    printf 'Diarchy KVM: already disabled\n'
+    return 0
+  fi
+  stop_lan_mouse || fail "Lan Mouse did not quit"
+  printf 'Diarchy KVM: disabled\n'
+}
+
+toggle_locked() {
+  if is_running; then
+    turn_off
+  else
+    turn_on
+  fi
+}
+
+case ${1:-} in
+  on) [[ $# == 1 ]] || fail "usage: diarchy-kvm {on|off|toggle|status}"; run_locked turn_on ;;
+  off) [[ $# == 1 ]] || fail "usage: diarchy-kvm {on|off|toggle|status}"; run_locked turn_off ;;
+  toggle)
+    [[ $# == 1 ]] || fail "usage: diarchy-kvm {on|off|toggle|status}"
+    run_locked toggle_locked
+    ;;
+  status) [[ $# == 1 ]] || fail "usage: diarchy-kvm {on|off|toggle|status}"; status ;;
+  *) fail "usage: diarchy-kvm {on|off|toggle|status}" ;;
+esac

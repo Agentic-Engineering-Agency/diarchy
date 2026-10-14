@@ -1,0 +1,8 @@
+{
+  "source": "https://forums.developer.nvidia.com/t/no-sys-class-drm-card0-entries-on-kernel-4-15/57855 (no DRM cards at all)",
+  "cards": [],
+  "expect": {
+    "DIARCHY": null,
+    "null": null
+  }
+}

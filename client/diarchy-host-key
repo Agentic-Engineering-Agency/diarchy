@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# diarchy-host-key scan | trust SHA256:<base64> | status
+# Pin the host SSH key (ed25519) in <config dir>/known_hosts.
+# Output is key=value lines on stdout.
+set -euo pipefail
+
+usage() {
+  printf 'diarchy-host-key: usage: diarchy-host-key scan | trust SHA256:<base64> | status\n' >&2
+  exit 64
+}
+
+failed() {
+  printf 'status=failed\nreason=%s\n' "$1"
+  exit 1
+}
+
+[[ $# -ge 1 ]] || usage
+command_name=$1
+case "$command_name" in
+  scan|status) [[ $# -eq 1 ]] || usage ;;
+  trust) [[ $# -eq 2 ]] || usage ;;
+  *) usage ;;
+esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+route_sh=${DIARCHY_ROUTE_SH:-$script_dir/diarchy-route.sh}
+keyscan_bin=${SSH_KEYSCAN_BIN:-/usr/bin/ssh-keyscan}
+keygen_bin=${SSH_KEYGEN_BIN:-/usr/bin/ssh-keygen}
+
+[[ -r "$route_sh" ]] || failed "Cannot read the route library."
+# shellcheck source=diarchy-route.sh
+source "$route_sh"
+
+# Keys are public, but the files stay private: only the owner can change them.
+umask 077
+
+cache_dir=${TMPDIR:-${HOME:-}/Library/Caches}
+work_dir=$(mktemp -d "$cache_dir/diarchy-host-key.XXXXXX" 2>/dev/null) || failed "Cannot create a temporary directory."
+tmp_files=()
+cleanup() {
+  rm -rf "$work_dir"
+  if [[ ${#tmp_files[@]} -gt 0 ]]; then
+    rm -f "${tmp_files[@]}"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 255' INT TERM HUP
+
+known_hosts=$(diarchy_known_hosts_path)
+pending="$known_hosts.pending"
+config_dir=$(dirname -- "$known_hosts")
+
+load_config() {
+  local config_loader=${DIARCHY_CONFIG_SH:-$script_dir/diarchy-config.sh} reason_file reason
+  [[ -r "$config_loader" ]] || failed "Cannot read the config loader."
+  # shellcheck source=diarchy-config.sh
+  source "$config_loader"
+  reason_file="$work_dir/config.err"
+  if ! diarchy_config_load 2>"$reason_file"; then
+    reason=$(tail -n 1 "$reason_file")
+    failed "${reason#diarchy-config: }"
+  fi
+  [[ -n "$DIARCHY_HOST_KEY_ALIAS" ]] || failed "No host is configured."
+}
+
+# Print the SHA256 fingerprint of the first key in a known_hosts style file.
+fingerprint_of() {
+  local file=$1 output
+  output=$("$keygen_bin" -lf "$file" -E sha256 2>/dev/null) || return 1
+  output=$(printf '%s\n' "$output" | awk 'NR == 1 { print $2 }')
+  [[ "$output" =~ ^SHA256:[A-Za-z0-9+/=]+$ ]] || return 1
+  printf '%s\n' "$output"
+}
+
+# Print the lines of a known_hosts file whose first field names the alias.
+alias_lines() {
+  awk -v alias="$DIARCHY_HOST_KEY_ALIAS" '
+    /^[[:space:]]*(#|$)/ { next }
+    NF >= 3 {
+      count = split($1, names, ",")
+      for (i = 1; i <= count; i++) {
+        if (names[i] == alias) { print; break }
+      }
+    }
+  ' "$1"
+}
+
+do_scan() {
+  local diag_file scanned key_line fingerprint pending_tmp
+  diag_file="$work_dir/route.diag"
+  if ! select_diarchy_route auto 2>"$diag_file"; then
+    reason=$(tail -n 1 "$diag_file")
+    failed "${reason#diarchy-route: }."
+  fi
+  if ! scanned=$("$keyscan_bin" -T 5 -t ed25519 -p "$DIARCHY_SSH_PORT" "$DIARCHY_ROUTE_HOST" 2>/dev/null); then
+    failed "Could not read the host key. Check that the host is online and SSH is running."
+  fi
+  key_line=$(printf '%s\n' "$scanned" | awk -v alias="$DIARCHY_HOST_KEY_ALIAS" '
+    /^#/ { next }
+    $2 == "ssh-ed25519" && NF >= 3 { print alias, $2, $3; exit }
+  ')
+  [[ -n "$key_line" ]] || failed "The host did not return an ed25519 key."
+  mkdir -p -- "$config_dir"
+  pending_tmp=$(mktemp "$config_dir/known_hosts.pending.XXXXXX") || failed "Cannot write to the config folder."
+  tmp_files+=("$pending_tmp")
+  printf '%s\n' "$key_line" >"$pending_tmp"
+  fingerprint=$(fingerprint_of "$pending_tmp") || failed "Could not read the host key fingerprint."
+  chmod 600 "$pending_tmp"
+  mv -f -- "$pending_tmp" "$pending"
+  printf 'status=scanned\nfingerprint=%s\n' "$fingerprint"
+}
+
+do_trust() {
+  local wanted=$1 actual new_file
+  [[ "$wanted" =~ ^SHA256:[A-Za-z0-9+/=]+$ ]] || failed "The fingerprint format is not valid."
+  [[ -f "$pending" ]] || failed "No scanned host key. Scan the host first."
+  actual=$(fingerprint_of "$pending") || failed "Could not read the scanned host key."
+  [[ "$actual" == "$wanted" ]] || failed "The fingerprint does not match the scanned host key."
+  mkdir -p -- "$config_dir"
+  new_file=$(mktemp "$config_dir/known_hosts.XXXXXX") || failed "Cannot write to the config folder."
+  tmp_files+=("$new_file")
+  if [[ -f "$known_hosts" ]]; then
+    awk -v alias="$DIARCHY_HOST_KEY_ALIAS" '
+      {
+        keep = 1
+        if ($0 !~ /^[[:space:]]*(#|$)/ && NF >= 3) {
+          count = split($1, names, ",")
+          for (i = 1; i <= count; i++) if (names[i] == alias) keep = 0
+        }
+        if (keep) print
+      }
+    ' "$known_hosts" >"$new_file"
+  fi
+  cat -- "$pending" >>"$new_file"
+  chmod 600 "$new_file"
+  mv -f -- "$new_file" "$known_hosts"
+  rm -f -- "$pending"
+  printf 'status=trusted\nfingerprint=%s\n' "$actual"
+}
+
+do_status() {
+  local line_file fingerprint
+  [[ -f "$known_hosts" ]] || { printf 'status=missing\n'; return 0; }
+  line_file="$work_dir/alias.line"
+  alias_lines "$known_hosts" | head -n 1 >"$line_file"
+  if [[ ! -s "$line_file" ]]; then
+    printf 'status=missing\n'
+    return 0
+  fi
+  fingerprint=$(fingerprint_of "$line_file") || failed "Could not read the pinned host key."
+  printf 'status=trusted\nfingerprint=%s\n' "$fingerprint"
+}
+
+load_config
+case "$command_name" in
+  scan) do_scan ;;
+  trust) do_trust "$2" ;;
+  status) do_status ;;
+esac

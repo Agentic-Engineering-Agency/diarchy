@@ -1,0 +1,130 @@
+name: Hardware report
+description: Tell us how Diarchy works on your Mac and your Omarchy host. Positive reports are as useful as bugs.
+labels: [hardware-report]
+title: "[HW] <Mac model> to <host model or GPU>: <works|partly|broken>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Diarchy was verified on one setup so far. Thank you for widening that.
+        **Do not paste IP addresses, SSIDs, host names, SSH keys, Sunshine credentials or tokens.**
+        Matrix rows use the format in `docs/compat/matrix.yml`.
+  - type: textarea
+    id: compat_report
+    attributes:
+      label: Compatibility Report
+      description: |
+        In the app, click "Copy Compatibility Report" and paste the text here. It has these fields in this order:
+        `Diarchy version`, `Mac model identifier`, `Chip`, `macOS version`, `Moonlight version`, `Lan Mouse version`,
+        `Tailscale installed`, `Route used (lan/tailscale/none)`, then the host report as a `json` block.
+      render: markdown
+    validations:
+      required: true
+  - type: input
+    id: host_model
+    attributes:
+      label: Host model
+      description: "Generic model name. Example: MSI Cyborg 15, or a desktop motherboard model. No serial number."
+    validations:
+      required: true
+  - type: input
+    id: host_arch
+    attributes:
+      label: Host CPU architecture
+      description: "Example: x86_64"
+    validations:
+      required: true
+  - type: input
+    id: gpu_class
+    attributes:
+      label: Host GPU class
+      description: "Example: hybrid-intel-nvidia, amd-igpu, nvidia-only, intel-arc"
+    validations:
+      required: true
+  - type: input
+    id: encoder
+    attributes:
+      label: Encoder used by Sunshine
+      description: "nvenc, vaapi, or unknown"
+  - type: input
+    id: omarchy
+    attributes:
+      label: Omarchy version and channel
+      description: "Example: 3.1.0 stable"
+    validations:
+      required: true
+  - type: input
+    id: mac_model
+    attributes:
+      label: Mac model and macOS
+      description: "Example: MacBook Pro M-series, macOS 15"
+    validations:
+      required: true
+  - type: dropdown
+    id: route
+    attributes:
+      label: Route type
+      options:
+        - LAN
+        - Tailscale
+        - Both
+    validations:
+      required: true
+  - type: dropdown
+    id: kvm
+    attributes:
+      label: "Result: KVM (mouse and keyboard cross the screen edge)"
+      options: [ok, partial, broken, untested, na]
+    validations:
+      required: true
+  - type: dropdown
+    id: clipboard_files
+    attributes:
+      label: "Result: clipboard and file portal"
+      options: [ok, partial, broken, untested, na]
+    validations:
+      required: true
+  - type: dropdown
+    id: streaming
+    attributes:
+      label: "Result: streaming (video and input)"
+      options: [ok, partial, broken, untested, na]
+    validations:
+      required: true
+  - type: dropdown
+    id: headless
+    attributes:
+      label: "Result: streaming with the virtual output (no monitor)"
+      options: [ok, partial, broken, untested, na]
+    validations:
+      required: true
+  - type: dropdown
+    id: lid_closed
+    attributes:
+      label: "Result: lid-closed mode (laptop host only)"
+      options: [ok, partial, broken, untested, na]
+    validations:
+      required: true
+  - type: dropdown
+    id: tailscale
+    attributes:
+      label: "Result: Tailscale route"
+      options: [ok, partial, broken, untested, na]
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Workarounds, glitches, anything that failed. Link a bug report for each "partial" or "broken".
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you send
+      options:
+        - label: I removed IPs, names and hostnames from the paste.
+          required: true
+        - label: I searched the existing hardware reports for my GPU and Mac.
+          required: true
+        - label: I use the latest release.
+          required: true

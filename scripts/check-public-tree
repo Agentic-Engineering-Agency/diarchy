@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Scan a tree for personal data before public release.
+
+Usage: scripts/check-public-tree [DIR]
+
+Scans files tracked by git (all files if DIR is not a git tree). Skips entries
+in DIR/.publicignore. Prints "path:line: <kind>" for each hit and never prints
+the matched value. Exit 0 = clean, 1 = hits.
+
+An optional local file DIR/.personal-data-denylist holds one literal per line
+(case-insensitive). Hits print as "path:line: denylist".
+"""
+import fnmatch
+import ipaddress
+import os
+import re
+import subprocess
+import sys
+
+IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w])(?!\.\d)")
+MAC = re.compile(r"(?<![0-9A-Fa-f:\\])((?:[0-9A-Fa-f]{2}(?::|\\\\:|\\:)){5}[0-9A-Fa-f]{2})(?![0-9A-Fa-f:])")
+USERS = re.compile(r"/Us" r"ers/([^/\s'\"`)\]>,;:*]+)")
+HOME = re.compile(r"(?<![\w.])/ho" r"me/([^/\s'\"`)\]>,;:*]+)")
+TSNET = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)*\.ts\.net\b")
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)")
+SECRET_PATTERNS = [
+    ("private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("ssh-public-key", re.compile(r"(?:ssh-(?:ed25519|rsa|dss)|ecdsa-sha2-nistp\d+) AAAA[0-9A-Za-z+/]{10,}")),
+    ("token", re.compile(r"\bghp_[0-9A-Za-z]{20,}|\bgithub_pat_[0-9A-Za-z_]{20,}|\btskey-[0-9A-Za-z-]{10,}")),
+    ("ipv6-tailscale", re.compile(r"fd7a:115c:" r"a1e0:", re.IGNORECASE)),
+    ("mac-address", re.compile(r"(?<![0-9A-Fa-f-])(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f-])")),
+    ("local-hostname", re.compile(r"(?<![\w./$%-])[A-Za-z0-9][A-Za-z0-9-]*\.local(?![\w/.-])")),
+]
+
+DOC_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+ALLOWED_IPS = {"100.64.0.10", "100.64.0.20"}
+RFC1918 = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+CIDR_SUFFIX = re.compile(r"/(\d{1,2})(?!\d)")
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+PLACEHOLDER_USERS = {
+    "user", "you", "runner", "example", "name", "username", "me", "<user>", "<name>",
+    "shared", "your-name", "yourname", "someone", "other",
+}
+PLACEHOLDER_HOMES = PLACEHOLDER_USERS
+EMAIL_OK_SUFFIX = ("example.com", "example.org", "example.net")
+
+
+def placeholder(name, allowed):
+    n = name.strip()
+    low = n.lower()
+    if low in allowed:
+        return True
+    if n.startswith(("$", "<", "{", "%", "[")) or n.endswith((">", "}")):
+        return True
+    if n.isupper():  # USER, USERNAME, NAME
+        return True
+    return False
+
+
+def ip_kind(text, rest):
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if text in ALLOWED_IPS or any(ip in n for n in DOC_NETS):
+        return None
+    if text.startswith("0.") or text.startswith("127.") or text == "255.255.255.255":
+        return None
+    # Exempt only an exact network base address, for example 100.64.0.0/10.
+    cidr = CIDR_SUFFIX.match(rest)
+    if cidr:
+        try:
+            ipaddress.ip_network(f"{text}/{cidr.group(1)}", strict=True)
+            return None
+        except ValueError:
+            pass
+    if any(ip in n for n in RFC1918):
+        return "rfc1918-ipv4"
+    if ip in CGNAT:
+        return "cgnat-ipv4"
+    return None
+
+
+def scan_line(line, denylist, allow=frozenset()):
+    kinds = []
+    for m in IPV4.finditer(line):
+        rest = line[m.end(1):]
+        k = ip_kind(m.group(1), rest)
+        if k and m.group(1) not in allow:
+            kinds.append(k)
+    for m in MAC.finditer(line):
+        norm = m.group(1).replace("\\\\", "").replace("\\", "").lower()
+        if not norm.startswith("00:00:5e:00:53:") and norm not in allow:
+            kinds.append("mac-address")
+    for m in USERS.finditer(line):
+        if not placeholder(m.group(1), PLACEHOLDER_USERS) and m.group(0) not in allow:
+            kinds.append("users-path")
+    for m in HOME.finditer(line):
+        if not placeholder(m.group(1), PLACEHOLDER_HOMES) and m.group(0) not in allow:
+            kinds.append("home-path")
+    for m in TSNET.finditer(line):
+        t = m.group(0)
+        if not any(t == a or t.endswith("." + a) for a in allow):
+            kinds.append("tailnet-name")
+    for m in EMAIL.finditer(line):
+        dom = m.group(1).lower()
+        local = m.group(0).lower()
+        if dom.endswith(EMAIL_OK_SUFFIX) or dom == "users.noreply.github.com":
+            continue
+        if m.group(0) in allow:
+            continue
+        if local == "noreply@github.com":
+            continue
+        if dom.rsplit(".", 1)[-1].isdigit():  # ssh user@IPv4 or name@version
+            continue
+        kinds.append("email")
+    for kind, rx in SECRET_PATTERNS:
+        for m in rx.finditer(line):
+            lit = m.group(0)
+            if lit in allow or (kind == "mac-address" and lit.lower().startswith("00-00-5e-00-53-")):
+                continue
+            kinds.append(kind)
+    low = line.lower()
+    if any(d in low for d in denylist):
+        kinds.append("denylist")
+    return kinds
+
+
+def load_allow(root):
+    """Literals from scripts/public-tree-allow.txt (fake test tokens only)."""
+    path = os.path.join(root, "scripts", "public-tree-allow.txt")
+    out = set()
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                s = raw.strip()
+                if s and not s.startswith("#"):
+                    out.add(s)
+    return out
+
+
+def load_ignore(root):
+    path = os.path.join(root, ".publicignore")
+    out = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                s = raw.strip()
+                if s and not s.startswith("#"):
+                    out.append(s.rstrip("/"))
+    return out
+
+
+def ignored(rel, patterns):
+    for p in patterns:
+        if fnmatch.fnmatchcase(rel, p) or rel.startswith(p + "/"):
+            return True
+        if fnmatch.fnmatchcase(rel, p + "/*"):
+            return True
+    return False
+
+
+def list_files(root):
+    try:
+        r = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True
+        )
+        top = subprocess.run(
+            ["git", "-C", root, "rev-parse", "--show-toplevel"], capture_output=True, check=True
+        ).stdout.decode().strip()
+        if os.path.realpath(top) == os.path.realpath(root):
+            return [p for p in r.stdout.decode("utf-8", "surrogateescape").split("\0") if p]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    files = []
+    for d, dirs, names in os.walk(root):
+        dirs[:] = [x for x in dirs if x != ".git"]
+        for n in names:
+            files.append(os.path.relpath(os.path.join(d, n), root))
+    return sorted(files)
+
+
+def main(argv):
+    root = argv[1] if len(argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    patterns = load_ignore(root)
+    denylist = []
+    dl = os.path.join(root, ".personal-data-denylist")
+    if os.path.isfile(dl):
+        with open(dl, encoding="utf-8") as fh:
+            denylist = [x.strip().lower() for x in fh if x.strip()]
+    allow = load_allow(root)
+    hits = 0
+    for rel in list_files(root):
+        if rel == ".personal-data-denylist" or ignored(rel, patterns):
+            continue
+        full = os.path.join(root, rel)
+        if os.path.islink(full):
+            text = os.readlink(full)
+            for kind in dict.fromkeys(scan_line(text, denylist, allow)):
+                print(f"{rel}:1: {kind}")
+                hits += 1
+            continue
+        if not os.path.isfile(full):
+            continue
+        try:
+            with open(full, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        if b"\0" in data:
+            continue
+        text = data.decode("utf-8", "replace")
+        for n, line in enumerate(text.splitlines(), 1):
+            for kind in dict.fromkeys(scan_line(line, denylist, allow)):
+                print(f"{rel}:{n}: {kind}")
+                hits += 1
+    return 1 if hits else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,540 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PYTHON_BIN=${PYTHON_BIN:-python3}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  diarchy-file send [--overwrite] [--dry-run] [--route lan|tailscale|auto] <path>...
+  diarchy-file get  [--overwrite] [--dry-run] [--route lan|tailscale|auto] <name>...
+  diarchy-file list [--route lan|tailscale|auto]
+EOF
+}
+
+fail_usage() {
+  usage >&2
+  exit 64
+}
+
+single_quote() {
+  local value=$1
+  printf "'"
+  while [[ "$value" == *"'"* ]]; do
+    printf "%s" "${value%%\'*}"
+    printf "%s" "'\\''"
+    value=${value#*\'}
+  done
+  printf "%s'" "$value"
+}
+
+escape_field() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+from __future__ import annotations
+import os
+import sys
+import urllib.parse
+
+sys.stdout.write(urllib.parse.quote_from_bytes(os.fsencode(sys.argv[1]), safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"))
+PY
+}
+
+escape_b64_field() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+from __future__ import annotations
+import base64
+import sys
+import urllib.parse
+
+encoded = sys.argv[1]
+encoded += "=" * (-len(encoded) % 4)
+sys.stdout.write(urllib.parse.quote_from_bytes(base64.urlsafe_b64decode(encoded.encode("ascii")), safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"))
+PY
+}
+
+shell_quote() {
+  local value=$1
+  if [[ -z "$value" ]]; then
+    printf "''"
+    return
+  fi
+  case "$value" in
+    *[!A-Za-z0-9_./:@%+=,-]*|[-]*)
+      single_quote "$value"
+      ;;
+    *)
+      printf "%s" "$value"
+      ;;
+  esac
+}
+
+remote_leaf_quote() {
+  local value=$1
+  case "$value" in
+    *[!A-Za-z0-9_.-]*|''|.*)
+      single_quote "$value"
+      ;;
+    *)
+      printf "%s" "$value"
+      ;;
+  esac
+}
+
+basename_only() {
+  local value=$1
+  [[ -n "$value" ]] || return 1
+  [[ "$value" != "." && "$value" != ".." ]] || return 1
+  [[ "$value" != */* ]] || return 1
+  return 0
+}
+
+file_size() {
+  local path=$1
+  if [[ -e "$path" && ! -d "$path" ]]; then
+    wc -c < "$path" | tr -d ' '
+  else
+    printf '0'
+  fi
+}
+
+iso8601_utc() {
+  local epoch=$1
+  "$PYTHON_BIN" - "$epoch" <<'PY'
+from __future__ import annotations
+import datetime
+import sys
+try:
+    epoch = int(float(sys.argv[1]))
+except ValueError:
+    raise SystemExit(1)
+print(datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+PY
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+route_sh=${DIARCHY_FILE_ROUTE_SH:-"$script_dir/diarchy-route.sh"}
+# shellcheck source=/dev/null
+source "$route_sh"
+
+verb=${1:-}
+[[ -n "$verb" ]] || fail_usage
+shift
+
+case "$verb" in send|get|list) ;; *) fail_usage ;; esac
+
+route=auto
+overwrite=0
+dry_run=0
+items=()
+
+while (($#)); do
+  case "$1" in
+    --overwrite)
+      [[ "$verb" != list ]] || fail_usage
+      overwrite=1
+      shift
+      ;;
+    --dry-run)
+      [[ "$verb" != list ]] || fail_usage
+      dry_run=1
+      shift
+      ;;
+    --route)
+      (($# >= 2)) || fail_usage
+      route=$2
+      case "$route" in auto|lan|tailscale) ;; *) fail_usage ;; esac
+      shift 2
+      ;;
+    --)
+      shift
+      while (($#)); do
+        items+=("$1")
+        shift
+      done
+      ;;
+    --*)
+      fail_usage
+      ;;
+    *)
+      items+=("$1")
+      shift
+      ;;
+  esac
+done
+
+case "$verb" in
+  send|get) ((${#items[@]} > 0)) || fail_usage ;;
+  list) ((${#items[@]} == 0)) || fail_usage ;;
+esac
+
+select_diarchy_route "$route"
+ssh_bin=${SSH_BIN:-ssh}
+rsync_bin=${RSYNC_BIN:-rsync}
+xattr_bin=${XATTR_BIN:-/usr/bin/xattr}
+
+ssh_transport_parts=("$ssh_bin" "${diarchy_ssh_options[@]}")
+ssh_transport=
+for part in "${ssh_transport_parts[@]}"; do
+  quoted=$(shell_quote "$part")
+  if [[ -z "$ssh_transport" ]]; then
+    ssh_transport=$quoted
+  else
+    ssh_transport="$ssh_transport $quoted"
+  fi
+done
+
+rsync_flags=(--archive --partial --partial-dir=.rsync-partial --itemize-changes --out-format=%i)
+if (( overwrite == 0 )); then
+  rsync_flags+=(--ignore-existing)
+fi
+
+# Largest item the Mac accepts from the host: 2 GiB. rsync enforces it per file.
+max_receive_bytes=2147483648
+get_rsync_flags=("${rsync_flags[@]}" --safe-links "--max-size=$max_receive_bytes")
+
+status_from_rsync() {
+  local returncode=$1 output=$2 line saw_update=0
+  if (( returncode != 0 )); then
+    printf 'failed'
+    return
+  fi
+  if [[ -z "$output" ]]; then
+    printf 'skipped-exists'
+    return
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == "created directory "* ]]; then
+      continue
+    fi
+    if [[ (${#line} -ne 9 && ${#line} -ne 11) || (${line:1:1} != f && ${line:1:1} != d) ]]; then
+      printf 'failed'
+      return
+    fi
+    case "${line:0:1}" in
+      '<'|'>'|'c') saw_update=1 ;;
+      *)
+        printf 'failed'
+        return
+        ;;
+    esac
+  done <<< "$output"
+  if (( saw_update )); then
+    printf 'ok'
+  else
+    printf 'failed'
+  fi
+}
+
+print_dry_run() {
+  local -a argv=("$@")
+  printf 'route=%s host=%s\n' "$DIARCHY_ROUTE_NAME" "$DIARCHY_ROUTE_HOST"
+  local first=1 arg
+  for arg in "${argv[@]}"; do
+    if (( first )); then
+      first=0
+    else
+      printf ' '
+    fi
+    shell_quote "$arg"
+  done
+  printf '\n'
+}
+
+run_rsync() {
+  local output rc
+  set +e
+  output=$("$rsync_bin" "$@" 2>&1)
+  rc=$?
+  set -e
+  printf '%s' "$output"
+  return "$rc"
+}
+
+send_one() {
+  local src=$1 src_for_rsync base remote output rc status bytes encoded_name
+  if [[ -L "$src" ]]; then
+    encoded_name=$(escape_field "$(basename -- "$src")")
+    printf 'send name=%s bytes=0 route=%s status=failed\n' "$encoded_name" "$DIARCHY_ROUTE_NAME"
+    printf 'diarchy-file: refusing to send a symbolic link\n' >&2
+    return 1
+  fi
+  if [[ ! -e "$src" ]]; then
+    encoded_name=$(escape_field "$(basename -- "$src")")
+    printf 'send name=%s bytes=0 route=%s status=failed\n' "$encoded_name" "$DIARCHY_ROUTE_NAME"
+    return 1
+  fi
+  src_for_rsync=$src
+  if [[ -d "$src" ]]; then
+    src_for_rsync="${src%/}/"
+  fi
+  base=$(basename -- "$src")
+  remote="$DIARCHY_SSH_ALIAS:~/Drop/from-mac/$(remote_leaf_quote "$base")"
+  bytes=$(file_size "$src")
+  local -a argv=("${rsync_flags[@]}" -e "$ssh_transport" -- "$src_for_rsync" "$remote")
+  if (( dry_run )); then
+    print_dry_run "$rsync_bin" "${argv[@]}"
+    return 0
+  fi
+  set +e
+  output=$(run_rsync "${argv[@]}")
+  rc=$?
+  set -e
+  status=$(status_from_rsync "$rc" "$output")
+  encoded_name=$(escape_field "$base")
+  printf 'send name=%s bytes=%s route=%s status=%s\n' "$encoded_name" "$bytes" "$DIARCHY_ROUTE_NAME" "$status"
+  [[ "$status" == ok ]]
+}
+
+quarantine_item() {
+  local path=$1 stamp
+  stamp=$(printf '%x' "$(date +%s)")
+  "$xattr_bin" -rw com.apple.quarantine "0081;$stamp;Diarchy;" "$path" >/dev/null 2>&1
+}
+
+publish_staged() {
+  local staged=$1 target=$2 allow_overwrite=$3
+  "$PYTHON_BIN" - "$staged" "$target" "$allow_overwrite" <<'PY'
+from __future__ import annotations
+
+import ctypes
+import errno
+import os
+import stat
+import sys
+from pathlib import Path
+
+staged = Path(sys.argv[1])
+target = Path(sys.argv[2])
+overwrite = sys.argv[3] == "1"
+
+
+def validate_and_normalize(path: Path) -> str:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        raise ValueError("staged item is missing")
+    if stat.S_ISLNK(mode):
+        raise ValueError("staged item is a symlink")
+    if stat.S_ISREG(mode):
+        path.chmod(0o600)
+        return "file"
+    if not stat.S_ISDIR(mode):
+        raise ValueError("staged item is not a regular file or directory")
+    path.chmod(0o700)
+    for current, directory_names, file_names in os.walk(path, followlinks=False):
+        current_path = Path(current)
+        for name in directory_names + file_names:
+            child = current_path / name
+            child_mode = child.lstat().st_mode
+            if stat.S_ISLNK(child_mode):
+                raise ValueError("staged directory contains a symlink")
+            if name in directory_names:
+                if not stat.S_ISDIR(child_mode):
+                    raise ValueError("staged directory contains a special file")
+                child.chmod(0o700)
+            else:
+                if not stat.S_ISREG(child_mode):
+                    raise ValueError("staged directory contains a special file")
+                child.chmod(0o600)
+    return "directory"
+
+
+def exclusive_rename(source: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renamex_np = getattr(libc, "renamex_np", None)
+    if renamex_np is not None:
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(source), os.fsencode(destination), 4)
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), destination)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        if error not in {errno.ENOSYS, errno.EINVAL}:
+            raise OSError(error, os.strerror(error), destination)
+    raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable", destination)
+
+
+def exchange_rename(source: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renamex_np = getattr(libc, "renamex_np", None)
+    if renamex_np is not None:
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(source), os.fsencode(destination), 2)
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 2)
+        if result == 0:
+            return
+        error = ctypes.get_errno()
+        if error not in {errno.ENOSYS, errno.EINVAL}:
+            raise OSError(error, os.strerror(error), destination)
+    raise OSError(errno.ENOTSUP, "atomic exchange rename is unavailable", destination)
+
+
+try:
+    kind = validate_and_normalize(staged)
+    if kind == "file":
+        size = staged.stat().st_size
+    else:
+        size = sum(child.stat().st_size for child in staged.rglob("*") if child.is_file())
+    print(size)
+    if overwrite:
+        if os.path.lexists(target):
+            exchange_rename(staged, target)
+        else:
+            os.replace(staged, target)
+    elif kind == "file":
+        os.link(staged, target)
+    else:
+        exclusive_rename(staged, target)
+except FileExistsError:
+    raise SystemExit(3)
+except (OSError, ValueError):
+    raise SystemExit(4)
+PY
+}
+
+get_one() {
+  local name=$1 remote dest_dir target stage_dir staged output rc status reason bytes encoded_name
+  if ! basename_only "$name"; then
+    printf 'diarchy-file: get accepts a single basename only\n' >&2
+    return 64
+  fi
+  dest_dir=$HOME/Drop/from-host
+  target=$dest_dir/$name
+  remote="$DIARCHY_SSH_ALIAS:~/Drop/to-mac/$(remote_leaf_quote "$name")"
+  encoded_name=$(escape_field "$name")
+  if (( dry_run )); then
+    local -a dry_argv=("${get_rsync_flags[@]}" -e "$ssh_transport" -- "$remote" "$dest_dir/.diarchy-file-get.XXXXXX/")
+    print_dry_run "$rsync_bin" "${dry_argv[@]}"
+    return 0
+  fi
+  mkdir -p -- "$dest_dir"
+  if (( overwrite == 0 )) && [[ -e "$target" ]]; then
+    printf 'get name=%s bytes=0 route=%s status=skipped-exists\n' "$encoded_name" "$DIARCHY_ROUTE_NAME"
+    return 1
+  fi
+  stage_dir=$(mktemp -d "$dest_dir/.diarchy-file-get.XXXXXX")
+  local -a argv=("${get_rsync_flags[@]}" -e "$ssh_transport" -- "$remote" "$stage_dir/")
+  set +e
+  output=$(run_rsync "${argv[@]}")
+  rc=$?
+  set -e
+  status=$(status_from_rsync "$rc" "$output")
+  reason=
+  if (( rc == 23 )) && [[ "$output" == *"No such file or directory"* ]]; then
+    reason=' reason=missing'
+  fi
+  staged=$stage_dir/$name
+  bytes=0
+  if [[ "$status" == ok ]]; then
+    set +e
+    bytes=$(publish_staged "$staged" "$target" "$overwrite")
+    publish_rc=$?
+    set -e
+    case "$publish_rc" in
+      0)
+        if ! quarantine_item "$target"; then
+          rm -rf -- "$target"
+          status=failed
+          bytes=0
+        fi
+        ;;
+      3) status=skipped-exists; bytes=0 ;;
+      *) status=failed; bytes=0 ;;
+    esac
+  else
+    bytes=0
+  fi
+  rm -rf -- "$stage_dir"
+  printf 'get name=%s bytes=%s route=%s status=%s%s\n' "$encoded_name" "$bytes" "$DIARCHY_ROUTE_NAME" "$status" "$reason"
+  [[ "$status" == ok ]]
+}
+
+list_files() {
+  local list_py remote_cmd output rc line encoded size epoch stamp escaped_name
+  list_py='import base64, os, pathlib
+root = pathlib.Path.home() / "Drop" / "to-mac"
+if root.exists():
+    for path in root.iterdir():
+        if (
+            path.name == ".rsync-partial"
+            or path.name.startswith(".diarchy-portal-stage-")
+            or path.name.startswith(".portal-stage-")
+            or path.is_symlink()
+            or not (path.is_file() or path.is_dir())
+        ):
+            continue
+        stat = path.stat()
+        size = stat.st_size if path.is_file() else sum(
+            child.stat().st_size for child in path.rglob("*")
+            if child.is_file() and not child.is_symlink()
+        )
+        encoded = base64.urlsafe_b64encode(os.fsencode(path.name)).decode("ascii").rstrip("=")
+        print(f"{encoded}\t{size}\t{int(stat.st_mtime)}")'
+  remote_cmd="python3 -c $(shell_quote "$list_py")"
+  set +e
+  output=$("$ssh_bin" "${diarchy_ssh_options[@]}" "$DIARCHY_SSH_ALIAS" "$remote_cmd" 2>/dev/null)
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    printf 'diarchy-file: list failed\n' >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r encoded size epoch; do
+    [[ -n "$encoded" ]] || continue
+    escaped_name=$(escape_b64_field "$encoded") || return 1
+    stamp=$(iso8601_utc "$epoch") || return 1
+    printf 'name=%s bytes=%s mtime=%s\n' "$escaped_name" "$size" "$stamp"
+  done <<< "$output"
+}
+
+aggregate=0
+case "$verb" in
+  send)
+    for item in "${items[@]}"; do
+      if ! send_one "$item"; then
+        aggregate=1
+      fi
+    done
+    ;;
+  get)
+    for item in "${items[@]}"; do
+      set +e
+      get_one "$item"
+      rc=$?
+      set -e
+      if (( rc == 64 )); then
+        exit 64
+      fi
+      if (( rc != 0 )); then
+        aggregate=1
+      fi
+    done
+    ;;
+  list)
+    list_files || aggregate=1
+    ;;
+esac
+
+exit "$aggregate"

@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest a change or a new capability.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Diarchy is a beta for an Apple Silicon Mac and an Omarchy host. Support for other hosts is not planned yet.
+        Say what you want to do, not only the change that you suggest.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do
+      description: The problem or the goal, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: How you think it can work. Optional.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today
+      description: The workaround that you use now. Optional.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you send
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: The change needs no `sudo` step in the installers or the agent (see ADR 0002).

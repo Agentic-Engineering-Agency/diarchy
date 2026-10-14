@@ -1,0 +1,70 @@
+name: Bug report
+description: Something does not work.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste IP addresses, SSIDs, host names, SSH keys, Sunshine credentials or tokens.**
+        Replace them with `<ip>`, `<ssid>`, `<host>`. Read every paste before you post it.
+        For a security problem, do not use this form. Use the private advisory link on the issue chooser page.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Steps, expected result, actual result.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      options:
+        - Off
+        - KVM
+        - Streaming
+        - Clipboard or file portal
+        - Installer
+    validations:
+      required: true
+  - type: dropdown
+    id: route
+    attributes:
+      label: Route type
+      options:
+        - LAN
+        - Tailscale
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Diarchy, macOS, Omarchy.
+    validations:
+      required: true
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Is this a regression?
+      options:
+        - I do not know
+        - No, it never worked
+        - Yes, it worked in an earlier version
+    validations:
+      required: true
+  - type: textarea
+    id: diag
+    attributes:
+      label: Diagnostics
+      description: Paste the diagnostics from the app. Check it and remove IPs, names and host names.
+      render: text
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you send
+      options:
+        - label: I searched the existing issues.
+          required: true
+        - label: I removed IPs, names, host names and secrets from everything I pasted.
+          required: true

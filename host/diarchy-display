@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HYPRCTL_BIN=${HYPRCTL_BIN:-hyprctl}
+JQ_BIN=${JQ_BIN:-jq}
+SOCAT_BIN=${SOCAT_BIN:-socat}
+SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-systemctl}
+PHYSICAL_OUTPUT=${PHYSICAL_OUTPUT:-}
+DISPLAY_ENV_FILE=${DIARCHY_DISPLAY_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/diarchy/display.env}
+HEADLESS_OUTPUT=${HEADLESS_OUTPUT:-DIARCHY}
+HEADLESS_MODE=${HEADLESS_MODE:-1920x1080@75}
+
+no_session() {
+  printf 'diarchy-display: no Hyprland session is running for this user\n' >&2
+  exit 1
+}
+
+ensure_hyprland_environment() {
+  local instances instance
+  instances=$("$HYPRCTL_BIN" instances -j) || no_session
+  instance=$(
+    printf '%s\n' "$instances" |
+      "$JQ_BIN" -cer '
+        map(select(
+          (.pid // 0) > 0
+          and (.instance // "") != ""
+          and (.wl_socket // "") != ""
+        ))
+        | sort_by(.time // 0)
+        | last
+      ' 2>/dev/null
+  ) || no_session
+  export HYPRLAND_INSTANCE_SIGNATURE
+  HYPRLAND_INSTANCE_SIGNATURE=$(
+    printf '%s\n' "$instance" | "$JQ_BIN" -er '.instance'
+  )
+  export WAYLAND_DISPLAY
+  WAYLAND_DISPLAY=$(
+    printf '%s\n' "$instance" | "$JQ_BIN" -er '.wl_socket'
+  )
+  export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+}
+
+trim() {
+  local value=$1
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  printf '%s' "$value"
+}
+
+# Hyprland takes either Lua or legacy (hyprlang) syntax, by config type. HYPR_SYNTAX is empty until a form
+# returns "ok". Then only that form is sent. Call this in the parent shell so the variable stays set.
+# Usage: hypr_send ACTION LUA_VERB LUA_ARG LEGACY_VERB [LEGACY_ARG...]
+HYPR_SYNTAX=
+hypr_send() {
+  local action=$1 lua_verb=$2 lua_arg=$3 lua_reply= legacy_reply= message=
+  shift 3
+  if [[ $HYPR_SYNTAX != legacy ]]; then
+    lua_reply=$("$HYPRCTL_BIN" "$lua_verb" "$lua_arg" 2>&1) || true
+    if [[ $(trim "$lua_reply") == ok ]]; then
+      HYPR_SYNTAX=lua
+      return 0
+    fi
+    message="lua: $lua_reply"
+  fi
+  if [[ $HYPR_SYNTAX != lua ]]; then
+    legacy_reply=$("$HYPRCTL_BIN" "$@" 2>&1) || true
+    if [[ $(trim "$legacy_reply") == ok ]]; then
+      HYPR_SYNTAX=legacy
+      return 0
+    fi
+    message="${message:+$message }legacy: $legacy_reply"
+  fi
+  printf 'diarchy-display: hyprctl %s failed: %s\n' "$action" "$message" >&2
+  exit 1
+}
+
+# CONFIGURED_OUTPUT: $PHYSICAL_OUTPUT, else the name saved in $DISPLAY_ENV_FILE (PHYSICAL_OUTPUT=NAME).
+# It is `auto`, a name, or empty. The selection runs again on every pass.
+CONFIGURED_OUTPUT=
+load_configured_output() {
+  local line
+  CONFIGURED_OUTPUT=$PHYSICAL_OUTPUT
+  if [[ -z $CONFIGURED_OUTPUT && -r $DISPLAY_ENV_FILE ]]; then
+    while IFS= read -r line; do
+      if [[ $line =~ ^PHYSICAL_OUTPUT=([A-Za-z0-9._-]{1,64})$ ]]; then
+        CONFIGURED_OUTPUT=${BASH_REMATCH[1]}
+      fi
+    done <"$DISPLAY_ENV_FILE"
+  fi
+}
+
+# Print the physical output to capture, or nothing when no physical monitor is enabled.
+# A configured name wins when it is enabled. Else: enabled internal panel, focused monitor, first monitor.
+select_physical() {
+  local monitors=$1
+  printf '%s\n' "$monitors" |
+    "$JQ_BIN" -r --arg headless "$HEADLESS_OUTPUT" --arg want "$CONFIGURED_OUTPUT" '
+      [.[] | select(.name != $headless and ((.disabled // false) | not))] as $enabled
+      | ($enabled | map(select(.name | test("^(eDP|LVDS|DSI)-")))) as $internal
+      | ($enabled | map(select(.name == $want))[0].name) as $named
+      | (if $want == "auto" then null else $named end)
+        // $internal[0].name
+        // ($enabled | map(select(.focused // false))[0].name)
+        // $enabled[0].name
+        // ""'
+}
+
+monitors_json() {
+  "$HYPRCTL_BIN" -j monitors all
+}
+
+output_exists() {
+  local output=$1
+  local monitors=$2
+  printf '%s\n' "$monitors" |
+    "$JQ_BIN" -e --arg output "$output" \
+      'any(.[]; .name == $output)' >/dev/null
+}
+
+headless_mode_is_correct() {
+  local monitors=$1
+  [[ $HEADLESS_MODE =~ ^([0-9]+)x([0-9]+)@([0-9]+([.][0-9]+)?)$ ]] ||
+    return 1
+
+  local width=${BASH_REMATCH[1]}
+  local height=${BASH_REMATCH[2]}
+  local refresh=${BASH_REMATCH[3]}
+  printf '%s\n' "$monitors" |
+    "$JQ_BIN" -e \
+      --arg output "$HEADLESS_OUTPUT" \
+      --argjson width "$width" \
+      --argjson height "$height" \
+      --argjson refresh "$refresh" \
+      'any(.[];
+        .name == $output
+        and ((.disabled // false) | not)
+        and .width == $width
+        and .height == $height
+        and .refreshRate == $refresh
+        and .x == 0
+        and .y == 0
+        and .scale == 1
+      )' >/dev/null
+}
+
+# All workspaces (id >= 1) on monitor $1 move to monitor $2. Special workspaces are moved by Hyprland itself.
+move_workspaces() {
+  local from=$1 to=$2 workspaces workspace workspace_ids
+  workspaces=$("$HYPRCTL_BIN" -j workspaces)
+  workspace_ids=$(
+    printf '%s\n' "$workspaces" |
+      "$JQ_BIN" -r --arg output "$from" \
+        '.[] | select(.monitor == $output and .id >= 1) | .id'
+  )
+  while IFS= read -r workspace; do
+    [[ -n $workspace ]] || continue
+    hypr_send "move workspace $workspace to $to" \
+      dispatch "hl.dsp.workspace.move({ workspace = \"$workspace\", monitor = \"$to\" })" \
+      dispatch moveworkspacetomonitor "$workspace" "$to"
+  done <<<"$workspace_ids"
+}
+
+# Every workspace not on the headless output moves to it. Then the busiest first workspace gets the focus.
+move_physical_workspaces_to_headless() {
+  local workspaces preferred workspace workspace_ids
+  workspaces=$("$HYPRCTL_BIN" -j workspaces)
+  preferred=$(
+    printf '%s\n' "$workspaces" |
+      "$JQ_BIN" -r --arg output "$HEADLESS_OUTPUT" \
+        '(
+          [.[] | select(.monitor != $output and .id >= 1 and (.windows // 0) > 0) | .id]
+          + [.[] | select(.monitor != $output and .id >= 1) | .id]
+        ) | first // empty'
+  )
+  workspace_ids=$(
+    printf '%s\n' "$workspaces" |
+      "$JQ_BIN" -r --arg output "$HEADLESS_OUTPUT" \
+        '.[] | select(.monitor != $output and .id >= 1) | .id'
+  )
+  while IFS= read -r workspace; do
+    [[ -n $workspace ]] || continue
+    hypr_send "move workspace $workspace to $HEADLESS_OUTPUT" \
+      dispatch "hl.dsp.workspace.move({ workspace = \"$workspace\", monitor = \"$HEADLESS_OUTPUT\" })" \
+      dispatch moveworkspacetomonitor "$workspace" "$HEADLESS_OUTPUT"
+  done <<<"$workspace_ids"
+  if [[ -n $preferred ]]; then
+    hypr_send "focus workspace $preferred" \
+      dispatch "hl.dsp.focus({ workspace = \"$preferred\" })" \
+      dispatch workspace "$preferred"
+  fi
+}
+
+send_headless_monitor_rule() {
+  hypr_send "monitor rule for $HEADLESS_OUTPUT" \
+    eval "hl.monitor({ output = \"$HEADLESS_OUTPUT\", mode = \"$HEADLESS_MODE\", position = \"0x0\", scale = 1 })" \
+    keyword monitor "$HEADLESS_OUTPUT,$HEADLESS_MODE,0x0,1"
+}
+
+hypr_output() {
+  local reply
+  reply=$("$HYPRCTL_BIN" output "$@" 2>&1) || true
+  if [[ $(trim "$reply") != ok ]]; then
+    printf 'diarchy-display: hyprctl output %s failed: %s\n' "$*" "$reply" >&2
+    exit 1
+  fi
+}
+
+select_output() {
+  local monitors selected
+  monitors=$(monitors_json)
+  "$JQ_BIN" -e 'type == "array"' <<<"$monitors" >/dev/null
+  selected=$(select_physical "$monitors")
+  if [[ -n $selected ]]; then
+    printf '%s\n' "$selected"
+    return 0
+  fi
+
+  printf '%s\n' "$HEADLESS_OUTPUT"
+  if ! output_exists "$HEADLESS_OUTPUT" "$monitors"; then
+    printf 'The %s output does not exist yet. It will be created at stream start.\n' "$HEADLESS_OUTPUT"
+  fi
+  return 0
+}
+
+reconcile() {
+  local monitors selected
+  monitors=$(monitors_json)
+  "$JQ_BIN" -e 'type == "array"' <<<"$monitors" >/dev/null
+  selected=$(select_physical "$monitors")
+  if [[ -n $selected ]]; then
+    if output_exists "$HEADLESS_OUTPUT" "$monitors"; then
+      move_workspaces "$HEADLESS_OUTPUT" "$selected"
+      hypr_output remove "$HEADLESS_OUTPUT"
+    fi
+    RECONCILED_OUTPUT=$selected
+    printf '%s\n' "$RECONCILED_OUTPUT"
+    return 0
+  fi
+
+  if output_exists "$HEADLESS_OUTPUT" "$monitors"; then
+    if ! headless_mode_is_correct "$monitors"; then
+      send_headless_monitor_rule
+    fi
+  else
+    hypr_output create headless "$HEADLESS_OUTPUT"
+    send_headless_monitor_rule
+  fi
+  move_physical_workspaces_to_headless
+  RECONCILED_OUTPUT=$HEADLESS_OUTPUT
+  printf '%s\n' "$RECONCILED_OUTPUT"
+}
+
+# Give the workspaces back to a physical monitor and remove the headless output. Never creates it.
+restore() {
+  local monitors selected
+  monitors=$(monitors_json)
+  "$JQ_BIN" -e 'type == "array"' <<<"$monitors" >/dev/null
+  selected=$(select_physical "$monitors")
+  if [[ -z $selected ]]; then
+    RECONCILED_OUTPUT=$HEADLESS_OUTPUT
+    printf '%s\n' "$RECONCILED_OUTPUT"
+    return 0
+  fi
+  if output_exists "$HEADLESS_OUTPUT" "$monitors"; then
+    move_workspaces "$HEADLESS_OUTPUT" "$selected"
+    hypr_output remove "$HEADLESS_OUTPUT"
+  fi
+  RECONCILED_OUTPUT=$selected
+  printf '%s\n' "$RECONCILED_OUTPUT"
+}
+
+event_socket() {
+  if [[ -n "${HYPR_EVENT_SOCKET:-}" ]]; then
+    printf '%s\n' "$HYPR_EVENT_SOCKET"
+    return 0
+  fi
+
+  local runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  printf '%s/hypr/%s/.socket2.sock\n' \
+    "$runtime_dir" "$HYPRLAND_INSTANCE_SIGNATURE"
+}
+
+watch_events() {
+  local event event_dir event_pid event_pipe previous selected socket socat_status
+  reconcile >/dev/null
+  previous=$RECONCILED_OUTPUT
+
+  while true; do
+    socket=$(event_socket)
+    event_dir=$(mktemp -d "${TMPDIR:-/tmp}/diarchy-events.XXXXXX")
+    event_pipe=$event_dir/events
+    mkfifo "$event_pipe"
+    trap 'rm -rf "${event_dir:-}"' EXIT
+    "$SOCAT_BIN" -u "UNIX-CONNECT:$socket" - >"$event_pipe" &
+    event_pid=$!
+    exec 3<"$event_pipe"
+
+    while IFS= read -r event <&3; do
+      case "$event" in
+        monitoradded*|monitorremoved*)
+          reconcile >/dev/null
+          selected=$RECONCILED_OUTPUT
+          if [[ $selected != "$previous" ]]; then
+            previous=$selected
+            "$SYSTEMCTL_BIN" --user try-restart \
+              diarchy-sunshine.service >/dev/null
+          fi
+          ;;
+      esac
+    done
+    exec 3<&-
+
+    socat_status=0
+    wait "$event_pid" || socat_status=$?
+    rm -rf "$event_dir"
+    trap - EXIT
+    if (( socat_status != 0 )); then
+      return "$socat_status"
+    fi
+    sleep 1
+  done
+}
+
+case "${1:-}" in
+  reconcile) ensure_hyprland_environment; load_configured_output; reconcile ;;
+  restore) ensure_hyprland_environment; load_configured_output; restore ;;
+  status) ensure_hyprland_environment; load_configured_output; select_output ;;
+  watch) ensure_hyprland_environment; load_configured_output; watch_events ;;
+  *)
+    printf 'usage: %s reconcile|restore|watch|status\n' "$0" >&2
+    exit 64
+    ;;
+esac

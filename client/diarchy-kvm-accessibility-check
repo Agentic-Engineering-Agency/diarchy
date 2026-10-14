@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SQLITE_BIN=${SQLITE_BIN:-/usr/bin/sqlite3}
+TCC_DB=${TCC_DB:-/Library/Application Support/com.apple.TCC/TCC.db}
+BUNDLE_ID=de.feschber.LanMouse
+
+fail() {
+  printf 'diarchy-kvm-accessibility-check: %s\n' "$*" >&2
+  exit 1
+}
+
+[[ -x $SQLITE_BIN ]] || fail "sqlite3 is missing"
+[[ -r $TCC_DB ]] || fail "the macOS TCC database is not readable"
+
+auth_value=$(
+  "$SQLITE_BIN" "$TCC_DB" \
+    "select auth_value from access where service='kTCCServiceAccessibility' and client='$BUNDLE_ID' limit 1;"
+) || fail "could not read the macOS Accessibility permission"
+
+[[ $auth_value == 2 ]] || fail "Accessibility permission is required for Lan Mouse"
+printf '[ok] Lan Mouse has macOS Accessibility permission\n'

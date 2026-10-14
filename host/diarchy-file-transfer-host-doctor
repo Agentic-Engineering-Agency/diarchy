@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+BIN_DIR=${BIN_DIR:-"$HOME/.local/bin"}
+UNIT_DIR=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
+UNIT_FILE="$UNIT_DIR/diarchy-file-portal.service"
+WL_PASTE_BIN=${WL_PASTE_BIN:-wl-paste}
+WL_COPY_BIN=${WL_COPY_BIN:-wl-copy}
+RSYNC_BIN=${RSYNC_BIN:-/usr/bin/rsync}
+NOTIFY_SEND_BIN=${NOTIFY_SEND_BIN:-/usr/bin/notify-send}
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3 2>/dev/null || true)}
+SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-/usr/bin/systemctl}
+failures=0
+warnings=0
+
+ok() { printf '[ok] %s\n' "$1"; }
+fail() { printf '[fail] %s\n' "$1" >&2; failures=$((failures + 1)); }
+warn() { printf '[warn] %s\n' "$1"; warnings=$((warnings + 1)); }
+
+mode_of() {
+  if stat -f %Lp "$1" >/dev/null 2>&1; then
+    stat -f %Lp "$1"
+  else
+    stat -c %a "$1"
+  fi
+}
+
+check_executable() {
+  local path=$1 label=$2
+  if [[ -x "$path" ]] && [[ "$(mode_of "$path")" == 755 ]]; then
+    ok "$label is executable and mode 755"
+  else
+    fail "$label is missing, not executable, or wrong mode"
+  fi
+}
+
+check_dir_mode() {
+  local path=$1 label=$2
+  if [[ -d "$path" ]] && [[ "$(mode_of "$path")" == 700 ]]; then
+    ok "$label is private"
+  else
+    fail "$label is missing or wrong mode"
+  fi
+}
+
+check_file_mode() {
+  local path=$1 mode=$2 label=$3
+  if [[ -f "$path" ]] && [[ "$(mode_of "$path")" == "$mode" ]]; then
+    ok "$label is installed with mode $mode"
+  else
+    fail "$label is missing or wrong mode"
+  fi
+}
+
+check_command_available() {
+  local command_path=$1 label=$2
+  if [[ -x "$command_path" ]] || command -v "$command_path" >/dev/null 2>&1; then
+    ok "$label is available"
+  else
+    fail "$label is unavailable"
+  fi
+}
+
+check_python_version() {
+  if [[ -x "$PYTHON_BIN" ]] \
+    && "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' >/dev/null 2>&1; then
+    ok "python3 is version 3.11 or newer"
+  else
+    fail "python3 3.11 or newer is unavailable"
+  fi
+}
+
+check_python_portal_dependencies() {
+  if [[ -x "$PYTHON_BIN" ]] \
+    && "$PYTHON_BIN" -c 'import gi; gi.require_version("Gtk", "3.0"); gi.require_version("GtkLayerShell", "0.1"); from gi.repository import Gtk, GtkLayerShell' >/dev/null 2>&1; then
+    ok "PyGObject GTK 3 and GtkLayerShell 0.1 are available"
+  else
+    fail "PyGObject GTK 3 and GtkLayerShell 0.1 are unavailable"
+  fi
+}
+
+check_user_service() {
+  if [[ ! -r "$UNIT_FILE" ]]; then
+    fail "diarchy-file-portal.service is missing"
+    return
+  fi
+  check_file_mode "$UNIT_FILE" 644 "diarchy-file-portal.service"
+  if grep -Fqx 'ExecStart=%h/.local/bin/diarchy-file-portal' "$UNIT_FILE" \
+    && grep -Fqx 'WantedBy=graphical-session.target' "$UNIT_FILE"; then
+    ok "diarchy-file-portal.service metadata is expected"
+  else
+    fail "diarchy-file-portal.service metadata is unexpected"
+  fi
+  if [[ -x "$SYSTEMCTL_BIN" ]] \
+    && "$SYSTEMCTL_BIN" --user is-enabled --quiet diarchy-file-portal.service \
+    && "$SYSTEMCTL_BIN" --user is-active --quiet diarchy-file-portal.service; then
+    ok "diarchy-file-portal.service is enabled and active"
+  else
+    fail "diarchy-file-portal.service is not enabled and active"
+  fi
+}
+
+check_kvm_service() {
+  if [[ -x "$SYSTEMCTL_BIN" ]] \
+    && "$SYSTEMCTL_BIN" --user is-active --quiet diarchy-kvm.service; then
+    ok "diarchy-kvm.service is active"
+  else
+    fail "diarchy-kvm.service is not active"
+  fi
+}
+
+check_executable "$BIN_DIR/diarchy-clipboard-remote" "Clipboard remote"
+check_executable "$BIN_DIR/diarchy-file-transfer-host-doctor" "Host doctor"
+check_executable "$BIN_DIR/diarchy-file-portal" "Host file portal"
+check_executable "$BIN_DIR/diarchy-file-portal-remote" "Host file portal remote"
+check_executable "$BIN_DIR/diarchy-file-portal-ingest" "Host file portal ingest"
+check_dir_mode "$HOME/Drop/from-mac" "Drop/from-mac"
+check_dir_mode "$HOME/Drop/to-mac" "Drop/to-mac"
+check_command_available "$WL_PASTE_BIN" "wl-paste"
+check_command_available "$WL_COPY_BIN" "wl-copy"
+check_command_available "$RSYNC_BIN" "rsync"
+check_command_available "$NOTIFY_SEND_BIN" "notify-send"
+check_python_version
+check_python_portal_dependencies
+check_kvm_service
+check_user_service
+
+printf '[ok] Summary: %d failure(s), %d warning(s)\n' "$failures" "$warnings"
+(( failures == 0 ))

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# diarchy-ssh [--route auto|lan|tailscale] -- <remote words...>
+# diarchy-ssh [--route auto|lan|tailscale] --print-route
+# Select a route to the host and exec ssh with the route options.
+# --print-route only selects the route and prints route=lan|tailscale|none.
+set -euo pipefail
+
+usage() {
+  printf 'diarchy-ssh: usage: diarchy-ssh [--route auto|lan|tailscale] (-- <remote words...> | --print-route)\n' >&2
+  exit 64
+}
+
+mode=auto
+separator_seen=0
+print_route=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --route)
+      [[ $# -ge 2 ]] || usage
+      mode=$2
+      shift 2
+      ;;
+    --print-route)
+      print_route=1
+      shift
+      ;;
+    --)
+      separator_seen=1
+      shift
+      break
+      ;;
+    *)
+      usage
+      ;;
+  esac
+done
+if [[ $print_route -eq 1 ]]; then
+  [[ $separator_seen -eq 0 && $# -eq 0 ]] || usage
+else
+  [[ $separator_seen -eq 1 ]] || usage
+fi
+case "$mode" in
+  auto|lan|tailscale) ;;
+  *) usage ;;
+esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+route_sh=${DIARCHY_ROUTE_SH:-$script_dir/diarchy-route.sh}
+ssh_bin=${SSH_BIN:-/usr/bin/ssh}
+
+if [[ ! -r "$route_sh" ]]; then
+  printf 'diarchy-ssh: cannot read route library: %s\n' "$route_sh" >&2
+  exit 255
+fi
+# shellcheck source=diarchy-route.sh
+source "$route_sh"
+
+# Route selection must run in this shell (it fills diarchy_ssh_options), so its
+# stderr goes to a file: the success-path `route=...` line is discarded and a
+# failure prints the reason.
+diag_file=$(mktemp "${TMPDIR:-${HOME:-}/Library/Caches}/diarchy-ssh.XXXXXX" 2>/dev/null) || {
+  printf 'diarchy-ssh: cannot create temporary file\n' >&2
+  exit 255
+}
+# Signals exit 255 so the EXIT trap removes the file; exec below never fires traps.
+trap 'rm -f "$diag_file"' EXIT
+trap 'exit 255' INT TERM HUP
+if ! select_diarchy_route "$mode" 2>"$diag_file"; then
+  if [[ $print_route -eq 1 ]] && ! grep -q '^diarchy-config:' "$diag_file"; then
+    printf 'route=none\n'
+    exit 0
+  fi
+  cat "$diag_file" >&2 || true
+  exit 255
+fi
+if [[ $print_route -eq 1 ]]; then
+  printf 'route=%s\n' "$DIARCHY_ROUTE_NAME"
+  exit 0
+fi
+trap - EXIT INT TERM HUP
+rm -f "$diag_file"
+
+if ! diarchy_host_key_pinned "$DIARCHY_HOST_KEY_ALIAS"; then
+  printf 'diarchy-ssh: host key not confirmed. Open Diarchy and confirm the host key.\n' >&2
+  exit 255
+fi
+
+# `--` keeps a remote word that starts with `-` from being parsed as an ssh option.
+exec "$ssh_bin" "${diarchy_ssh_options[@]}" \
+  -o ConnectTimeout=5 \
+  "$DIARCHY_SSH_ALIAS" -- "$@"

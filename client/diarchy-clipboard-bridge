@@ -1,0 +1,776 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: diarchy-clipboard-bridge [--route auto|lan|tailscale] [--poll-ms N]
+EOF
+}
+
+route=auto
+poll_ms=200
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --route)
+      [[ $# -ge 2 ]] || { usage >&2; exit 64; }
+      route=$2
+      shift 2
+      ;;
+    --poll-ms)
+      [[ $# -ge 2 ]] || { usage >&2; exit 64; }
+      poll_ms=$2
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 64
+      ;;
+  esac
+done
+
+case "$route" in auto|lan|tailscale) ;; *) usage >&2; exit 64 ;; esac
+case "$poll_ms" in ''|*[!0-9]*) usage >&2; exit 64 ;; esac
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+route_sh=${DIARCHY_CLIPBOARD_ROUTE_SH:-"$script_dir/diarchy-route.sh"}
+# shellcheck source=/dev/null
+source "$route_sh"
+select_diarchy_route "$route"
+
+python_payload=$(awk 'found { print } /^# PYTHON_MODULE_START$/ { found = 1 }' "$0")
+ssh_bin=${SSH_BIN:-ssh}
+DIARCHY_BRIDGE_ROUTE_SH=$route_sh DIARCHY_BRIDGE_ROUTE_MODE=$route \
+  exec python3 -c "$python_payload" --diarchy-clipboard-bridge-runtime-v1 --routed "$poll_ms" "$ssh_bin" "${diarchy_ssh_options[@]}" "$DIARCHY_SSH_ALIAS" "\$HOME/.local/bin/diarchy-clipboard-remote --poll-ms $poll_ms"
+
+# PYTHON_MODULE_START
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import os
+import re
+import shutil
+import stat
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import BinaryIO, Callable
+
+MAX_BYTES = 102400
+HEADER = re.compile(rb"^CLIP ([0-9a-f]{64}) ([0-9]+)\n$")
+
+def validate_text_payload(payload: bytes) -> bool:
+    if len(payload) > MAX_BYTES:
+        return False
+    try:
+        payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def encode_frame(payload: bytes) -> bytes:
+    if not validate_text_payload(payload):
+        raise ValueError("clipboard payload must be valid UTF-8 text within size limit")
+    digest = hashlib.sha256(payload).hexdigest().encode("ascii")
+    return b"CLIP " + digest + b" " + str(len(payload)).encode("ascii") + b"\n" + payload
+
+
+def _read_source_byte(stream: BinaryIO, pending: bytearray) -> bytes:
+    if pending:
+        value = bytes(pending[:1])
+        del pending[:1]
+        return value
+    return stream.read(1)
+
+
+def _read_source_line(stream: BinaryIO, pending: bytearray, limit: int) -> bytes:
+    line = bytearray()
+    while len(line) < limit:
+        value = _read_source_byte(stream, pending)
+        if not value:
+            break
+        line.extend(value)
+        if value == b"\n":
+            break
+    return bytes(line)
+
+
+def _read_source_exact(stream: BinaryIO, pending: bytearray, length: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < length:
+        if pending:
+            take = min(length - len(payload), len(pending))
+            payload.extend(pending[:take])
+            del pending[:take]
+            continue
+        chunk = stream.read(length - len(payload))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+def diagnostic_message(
+    decision: str,
+    direction: str,
+    payload: bytes | None = None,
+    *,
+    byte_length: int | None = None,
+) -> str:
+    if byte_length is None:
+        byte_length = len(payload) if payload is not None else 0
+    return f"{decision} direction={direction} bytes={byte_length}"
+
+
+def decode_frame(
+    stream: BinaryIO,
+    diagnostic: Callable[[str], None] | None = None,
+    direction: str = "remote",
+) -> bytes | None:
+    pending = bytearray()
+    marker = b"CLIP "
+    discarded_bytes = 0
+    decode_reported = False
+    while True:
+        matched = 0
+        while matched < len(marker):
+            value = _read_source_byte(stream, pending)
+            if not value:
+                if (discarded_bytes or matched) and not decode_reported and diagnostic is not None:
+                    diagnostic(
+                        diagnostic_message(
+                            "dropped:decode",
+                            direction,
+                            byte_length=discarded_bytes + matched,
+                        )
+                    )
+                return None
+            if value == marker[matched : matched + 1]:
+                matched += 1
+            else:
+                discarded_bytes += matched + (0 if value == marker[:1] else 1)
+                matched = 1 if value == marker[:1] else 0
+
+        if discarded_bytes and not decode_reported and diagnostic is not None:
+            diagnostic(
+                diagnostic_message(
+                    "dropped:decode",
+                    direction,
+                    byte_length=discarded_bytes,
+                )
+            )
+        discarded_bytes = 0
+        decode_reported = False
+
+        suffix = _read_source_line(stream, pending, 96)
+        header = marker + suffix
+        match = HEADER.match(header)
+        if not match or int(match.group(2)) > MAX_BYTES:
+            if diagnostic is not None:
+                diagnostic(
+                    diagnostic_message(
+                        "dropped:decode",
+                        direction,
+                        byte_length=len(header),
+                    )
+                )
+            decode_reported = True
+            pending = bytearray(header[1:]) + pending
+            continue
+
+        expected = match.group(1).decode("ascii")
+        length = int(match.group(2))
+        payload = _read_source_exact(stream, pending, length)
+        digest = hashlib.sha256(payload).hexdigest()
+        if (
+            len(payload) != length
+            or digest != expected
+            or not validate_text_payload(payload)
+        ):
+            if diagnostic is not None:
+                diagnostic(
+                    diagnostic_message(
+                        "dropped:decode",
+                        direction,
+                        payload,
+                        byte_length=length,
+                    )
+                )
+            continue
+        return payload
+
+
+class ClipboardState:
+    def __init__(self) -> None:
+        self.last_out_hash: str | None = None
+        self.last_in_hash: str | None = None
+
+
+def _is_nonempty_text(payload: bytes | None) -> bool:
+    if not payload:
+        return False
+    try:
+        payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def apply_incoming_payload(
+    payload: bytes,
+    state: ClipboardState,
+    read_current: Callable[[], bytes | None],
+    apply_payload: Callable[[bytes], bool],
+    diagnostic: Callable[[str], None],
+    direction: str,
+) -> bool:
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest == state.last_out_hash:
+        diagnostic(diagnostic_message("dropped:echo", direction, payload))
+        return False
+    if not payload and not _is_nonempty_text(read_current()):
+        diagnostic(diagnostic_message("empty-no-change", direction, payload))
+        return False
+    previous = state.last_in_hash
+    state.last_in_hash = digest
+    if not apply_payload(payload):
+        state.last_in_hash = previous
+        return False
+    diagnostic(diagnostic_message("applied", direction, payload))
+    return True
+
+
+def should_emit(local_digest: str, last_incoming_digest: str | None) -> bool:
+    return bool(local_digest) and local_digest != last_incoming_digest
+
+
+def frame_for_local_change(payload: bytes, last_incoming_digest: str | None) -> bytes | None:
+    if not payload or not validate_text_payload(payload):
+        return None
+    digest = hashlib.sha256(payload).hexdigest()
+    if not should_emit(digest, last_incoming_digest):
+        return None
+    return encode_frame(payload)
+
+
+def local_change_frame_and_digest(payload: bytes, last_incoming_digest: str | None) -> tuple[bytes | None, str | None]:
+    if not payload or not validate_text_payload(payload):
+        return None, last_incoming_digest
+    digest = hashlib.sha256(payload).hexdigest()
+    if not should_emit(digest, last_incoming_digest):
+        return None, last_incoming_digest
+    return encode_frame(payload), digest
+
+
+def _which(name: str, env: dict[str, str] | None = None) -> str:
+    path = shutil.which(name, path=(env or os.environ).get("PATH"))
+    return path or name
+
+
+# Pasteboard types that password managers and system tools use to mark an item
+# as secret, short-lived or machine-made. The bridge never sends these items.
+SENSITIVE_PASTEBOARD_TYPES = frozenset(
+    {
+        "org.nspasteboard.ConcealedType",
+        "org.nspasteboard.TransientType",
+        "org.nspasteboard.AutoGeneratedType",
+    }
+)
+PASTEBOARD_TYPES_SCRIPT = (
+    "ObjC.import('AppKit');"
+    "var types = $.NSPasteboard.generalPasteboard.types;"
+    "var names = [];"
+    "for (var i = 0; i < types.count; i++) { names.push(ObjC.unwrap(types.objectAtIndex(i))); }"
+    "names.join('\\n')"
+)
+
+
+def local_clipboard_command(env: dict[str, str] | None = None) -> list[str]:
+    return [_which("pbpaste", env), "-Prefer", "txt"]
+
+
+def pasteboard_types_command(env: dict[str, str] | None = None) -> list[str]:
+    return [_which("osascript", env), "-l", "JavaScript", "-e", PASTEBOARD_TYPES_SCRIPT]
+
+
+def local_clipboard_is_sensitive(env: dict[str, str] | None = None, timeout: float = 2.0) -> bool:
+    """Return True when the pasteboard item is marked secret or when the types cannot be read."""
+    try:
+        output = subprocess.check_output(
+            pasteboard_types_command(env), env=env, timeout=timeout, stderr=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return True
+    names = {line.strip() for line in output.decode("utf-8", "replace").splitlines()}
+    return bool(names & SENSITIVE_PASTEBOARD_TYPES)
+
+
+def read_local_clipboard_raw(env: dict[str, str] | None = None, timeout: float = 2.0) -> bytes | None:
+    """Read at most MAX_BYTES+1 bytes so an oversized clipboard cannot fill memory."""
+    limit = MAX_BYTES + 1
+    try:
+        child = subprocess.Popen(
+            local_clipboard_command(env), env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except OSError:
+        return None
+    timed_out = threading.Event()
+
+    def expire() -> None:
+        timed_out.set()
+        child.kill()
+
+    timer = threading.Timer(timeout, expire)
+    timer.start()
+    try:
+        assert child.stdout is not None
+        data = child.stdout.read(limit)
+    finally:
+        timer.cancel()
+        child.kill()
+        child.wait()
+        if child.stdout is not None:
+            child.stdout.close()
+    if timed_out.is_set():
+        return None
+    if len(data) >= limit:
+        return data
+    return data if child.returncode == 0 else None
+
+
+def read_local_clipboard(env: dict[str, str] | None = None, timeout: float = 2.0) -> bytes | None:
+    payload = read_local_clipboard_raw(env=env, timeout=timeout)
+    return payload if payload is not None and validate_text_payload(payload) else None
+
+
+def write_local_clipboard(payload: bytes, env: dict[str, str] | None = None, timeout: float = 2.0) -> bool:
+    if not validate_text_payload(payload):
+        return False
+    try:
+        result = subprocess.run([_which("pbcopy", env)], input=payload, env=env, timeout=timeout, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return result.returncode == 0
+
+
+def _current_uid() -> int:
+    return os.getuid()
+
+
+def _runtime_base(env: dict[str, str] | None = None) -> Path:
+    environ = env or os.environ
+    tmpdir = environ.get("TMPDIR")
+    if tmpdir:
+        return Path(tmpdir)
+    home = environ.get("HOME") or str(Path.home())
+    return Path(home) / "Library" / "Caches"
+
+
+def runtime_dir(env: dict[str, str] | None = None) -> Path:
+    return _runtime_base(env) / f"diarchy-clipboard-bridge-{os.getuid()}"
+
+
+def runtime_lock_path(env: dict[str, str] | None = None) -> Path:
+    return _runtime_base(env) / f"diarchy-clipboard-bridge-{os.getuid()}.lock"
+
+
+def _assert_owned_directory(directory: Path) -> None:
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != _current_uid():
+        raise RuntimeError("clipboard bridge runtime directory is not owned by the current user")
+
+
+BRIDGE_COMMAND_IDENTITY = "diarchy-clipboard-bridge-runtime-v1"
+
+
+class RuntimeLock:
+    def __init__(self, directory: Path, lock_path: Path, lock_fd: int) -> None:
+        self.directory = directory
+        self.lock_path = lock_path
+        self.lock_fd = lock_fd
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.directory)
+
+
+def _command_identity(pid: int) -> str:
+    try:
+        command = subprocess.check_output(["ps", "-p", str(pid), "-o", "command="], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
+    return BRIDGE_COMMAND_IDENTITY if f" --{BRIDGE_COMMAND_IDENTITY} " in f" {command} " else command
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_owner_file(pid_file: Path) -> tuple[int, str] | None:
+    try:
+        lines = pid_file.read_text().splitlines()
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    try:
+        pid = int(lines[0])
+    except ValueError:
+        return None
+    return pid, lines[1]
+
+
+def acquire_runtime(
+    env: dict[str, str] | None = None,
+    command_identity: Callable[[int], str] = _command_identity,
+    before_pid_write: Callable[[], object] | None = None,
+) -> RuntimeLock:
+    directory = runtime_dir(env)
+    lock_file = runtime_lock_path(env)
+    lock_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(lock_fd)
+        raise RuntimeError("clipboard bridge is already running") from exc
+
+    try:
+        _assert_owned_directory(directory)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        pid_file = directory / "pid"
+        owner = _read_owner_file(pid_file)
+        if owner is not None:
+            previous, stored_identity = owner
+            exact_live_owner = (
+                previous > 0
+                and previous != os.getpid()
+                and stored_identity == BRIDGE_COMMAND_IDENTITY
+                and command_identity(previous) == BRIDGE_COMMAND_IDENTITY
+            )
+            if exact_live_owner:
+                raise RuntimeError("clipboard bridge is already running")
+        for stale_name in ("pid", "status"):
+            try:
+                (directory / stale_name).unlink()
+            except FileNotFoundError:
+                pass
+        if before_pid_write is not None:
+            before_pid_write()
+        pid_file.write_text(f"{os.getpid()}\n{BRIDGE_COMMAND_IDENTITY}\n")
+        return RuntimeLock(directory, lock_file, lock_fd)
+    except BaseException:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+        raise
+
+
+def release_runtime(runtime: RuntimeLock | Path) -> None:
+    if isinstance(runtime, RuntimeLock):
+        directory = runtime.directory
+        lock_fd: int | None = runtime.lock_fd
+        runtime.lock_fd = -1
+    else:
+        directory = runtime
+        lock_fd = None
+    pid_file = directory / "pid"
+    try:
+        try:
+            owner = _read_owner_file(pid_file)
+            if owner is not None and owner[0] == os.getpid() and owner[1] == BRIDGE_COMMAND_IDENTITY:
+                pid_file.unlink()
+            directory.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+    finally:
+        if lock_fd is not None and lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+
+
+
+
+
+_DIAGNOSTIC_FILE_LOCK = threading.Lock()
+_DEBUG_LOG_MAX_BYTES = 65536
+
+
+def emit_diagnostic(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+    debug_log = os.environ.get("DIARCHY_CLIPBOARD_DEBUG_LOG")
+    if not debug_log:
+        return
+    encoded = (message + "\n").encode("utf-8", "replace")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        with _DIAGNOSTIC_FILE_LOCK:
+            descriptor = os.open(debug_log, flags, 0o600)
+            with os.fdopen(descriptor, "r+b") as log:
+                log.seek(0, os.SEEK_END)
+                log.write(encoded)
+                size = log.tell()
+                if size > _DEBUG_LOG_MAX_BYTES:
+                    log.seek(size - _DEBUG_LOG_MAX_BYTES)
+                    retained = log.read()
+                    log.seek(0)
+                    log.write(retained)
+                    log.truncate()
+    except OSError:
+        pass
+
+
+def _copy_remote_to_local(
+    remote: subprocess.Popen[bytes],
+    stop: threading.Event,
+    state: ClipboardState,
+    diagnostic: Callable[[str], None] = emit_diagnostic,
+    state_lock: threading.Lock | None = None,
+) -> None:
+    lock = state_lock or threading.Lock()
+    while not stop.is_set():
+        payload = (
+            decode_frame(remote.stdout, diagnostic, "remote")
+            if remote.stdout
+            else None
+        )
+        if payload is None:
+            return
+        with lock:
+            apply_incoming_payload(
+                payload,
+                state,
+                read_local_clipboard_raw,
+                write_local_clipboard,
+                diagnostic,
+                "remote",
+            )
+
+
+
+
+def _copy_local_to_remote(
+    remote: subprocess.Popen[bytes],
+    stop: threading.Event,
+    poll_ms: int,
+    state: ClipboardState,
+    diagnostic: Callable[[str], None] = emit_diagnostic,
+    state_lock: threading.Lock | None = None,
+) -> None:
+    lock = state_lock or threading.Lock()
+    previous_observed_digest: str | None = None
+    while not stop.is_set() and remote.poll() is None:
+        payload = read_local_clipboard_raw()
+        if payload is None:
+            time.sleep(poll_ms / 1000)
+            continue
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest == previous_observed_digest:
+            time.sleep(poll_ms / 1000)
+            continue
+        previous_observed_digest = digest
+        if len(payload) > MAX_BYTES:
+            diagnostic(diagnostic_message("dropped:cap", "local", payload))
+            time.sleep(poll_ms / 1000)
+            continue
+        if not validate_text_payload(payload):
+            diagnostic(diagnostic_message("dropped:decode", "local", payload))
+            time.sleep(poll_ms / 1000)
+            continue
+        if not payload:
+            diagnostic(diagnostic_message("empty-no-change", "local", payload))
+            time.sleep(poll_ms / 1000)
+            continue
+        if local_clipboard_is_sensitive():
+            diagnostic(diagnostic_message("dropped:sensitive", "local", payload))
+            time.sleep(poll_ms / 1000)
+            continue
+        with lock:
+            if digest == state.last_in_hash:
+                diagnostic(diagnostic_message("dropped:echo", "local", payload))
+                time.sleep(poll_ms / 1000)
+                continue
+        if remote.stdin is not None:
+            try:
+                remote.stdin.write(encode_frame(payload))
+                remote.stdin.flush()
+            except BrokenPipeError:
+                return
+            with lock:
+                state.last_out_hash = digest
+            diagnostic(diagnostic_message("sent", "local", payload))
+        time.sleep(poll_ms / 1000)
+
+
+def _drain_child_stderr(stream: BinaryIO | None) -> None:
+    if stream is None:
+        return
+    while stream.read(8192):
+        pass
+
+
+def supervise(
+    run_once: Callable[[], int],
+    stop: threading.Event,
+    sleep: Callable[[float], object] | None = None,
+    now: Callable[[], float] = time.monotonic,
+    base: float = 1.0,
+    cap: float = 30.0,
+    healthy: float = 60.0,
+) -> int:
+    """Run `run_once` again after every exit, with a doubling pause (capped); a session that lived at least
+    `healthy` seconds resets the pause. Returns the last exit code once `stop` is set."""
+    wait = sleep if sleep is not None else stop.wait
+    delay = base
+    while True:
+        started = now()
+        code = run_once()
+        if stop.is_set():
+            return code
+        if now() - started >= healthy:
+            delay = base
+        wait(delay)
+        if stop.is_set():
+            return code
+        delay = min(delay * 2, cap)
+
+
+def reselect_ssh_argv(previous: list[str]) -> list[str] | None:
+    """The ssh command line for a fresh route choice, or `previous` when the wrapper gave no route script.
+    `None` when no route is reachable."""
+    route_sh = os.environ.get("DIARCHY_BRIDGE_ROUTE_SH")
+    if not route_sh:
+        return previous
+    script = (
+        'set -euo pipefail\nsource "$1"\nselect_diarchy_route "$2"\n'
+        "printf '%s\\0' \"$DIARCHY_SSH_ALIAS\" \"${diarchy_ssh_options[@]}\"\n"
+    )
+    try:
+        raw = subprocess.run(
+            ["/bin/bash", "-c", script, "diarchy-clipboard-bridge", route_sh,
+             os.environ.get("DIARCHY_BRIDGE_ROUTE_MODE", "auto")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parts = [os.fsdecode(part) for part in raw.split(b"\0") if part]
+    if not parts:
+        return None
+    alias, *options = parts
+    return [previous[0], *options, alias, previous[-1]]
+
+
+def run_bridge(poll_ms: int, ssh_argv: list[str]) -> int:
+    directory = acquire_runtime()
+    stop = threading.Event()
+    remote: subprocess.Popen[bytes] | None = None
+
+    def shutdown(signum: int | None = None, frame: object | None = None) -> None:
+        stop.set()
+        if remote is not None and remote.poll() is None:
+            if remote.stdin is not None and not remote.stdin.closed:
+                remote.stdin.close()
+            try:
+                remote.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                remote.terminate()
+                try:
+                    remote.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    remote.kill()
+                    remote.wait(timeout=2)
+        release_runtime(directory)
+        if signum is not None:
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    def run_session(argv: list[str]) -> int:
+        nonlocal remote
+        remote = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_child_stderr,
+            args=(remote.stderr,),
+            daemon=True,
+        )
+        stderr_thread.start()
+        once = os.environ.get("DIARCHY_CLIPBOARD_RUNTIME_ONCE") == "1"
+        if not once:
+            state = ClipboardState()
+            state_lock = threading.Lock()
+            for target, args in (
+                (_copy_remote_to_local, (remote, stop, state, emit_diagnostic, state_lock)),
+                (_copy_local_to_remote, (remote, stop, poll_ms, state, emit_diagnostic, state_lock)),
+            ):
+                threading.Thread(target=target, args=args, daemon=True).start()
+        while remote.poll() is None and not stop.is_set():
+            time.sleep(0.02 if once else 0.1)
+        returncode = remote.returncode or 0
+        stderr_thread.join(timeout=1)
+        if returncode != 0 and not stop.is_set():
+            emit_diagnostic(
+                diagnostic_message(
+                    "dropped:ssh-refused",
+                    "remote",
+                    byte_length=0,
+                )
+            )
+        return returncode
+
+    try:
+        if os.environ.get("DIARCHY_CLIPBOARD_RUNTIME_ONCE") == "1":
+            return run_session(ssh_argv)
+        first = True
+
+        def run_once() -> int:
+            nonlocal first
+            argv = ssh_argv
+            if not first:
+                # The route is chosen again on every restart: after sleep or a network change it can differ.
+                argv = reselect_ssh_argv(ssh_argv)
+                if argv is None:
+                    return 255
+            first = False
+            return run_session(argv)
+
+        return supervise(run_once, stop)
+    finally:
+        shutdown()
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == f"--{BRIDGE_COMMAND_IDENTITY}":
+        argv = argv[1:]
+    if len(argv) < 4 or argv[0] != "--routed":
+        return 64
+    poll_ms = int(argv[1])
+    ssh_argv = argv[2:]
+    return run_bridge(poll_ms, ssh_argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
