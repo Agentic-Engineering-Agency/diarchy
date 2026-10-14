@@ -49,7 +49,7 @@ public final class MoonlightWindowActivator: StreamWindowActivating, @unchecked 
         runner: any CommandRunner,
         lookup: @escaping @Sendable (Int32) async -> (any ActivatableApp)?,
         isAlive: @escaping @Sendable (Int32) -> Bool = MoonlightWindowActivator.processIsAlive,
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        sleep: @escaping @Sendable (Duration) async throws -> Void = systemSleep
     ) {
         self.runner = runner
         self.lookup = lookup

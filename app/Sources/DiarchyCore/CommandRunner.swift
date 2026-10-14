@@ -80,6 +80,14 @@ extension ChildProcess {
     }
 }
 
+/// The real sleep that every injectable `sleep` defaults to.
+///
+/// A named function, not the closure literal `{ try await Task.sleep(for: $0) }` as a default argument: Swift 6.2 and
+/// 6.3 (Xcode 26) built that default so that a cancelled sleep aborted the process in `swift_task_dealloc`.
+@Sendable public func systemSleep(_ duration: Duration) async throws {
+    try await Task.sleep(for: duration)
+}
+
 public protocol CommandRunner: Sendable {
     /// `environment == nil` inherits the process environment; otherwise it replaces it entirely.
     func run(

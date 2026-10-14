@@ -49,7 +49,7 @@ public struct Pairing: Sendable {
 
     public init(
         paths: Paths, store: ConfigStore, runner: any CommandRunner, agent: HostAgentClient,
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        sleep: @escaping @Sendable (Duration) async throws -> Void = systemSleep
     ) {
         self.paths = paths
         self.store = store
@@ -242,7 +242,7 @@ public struct MoonlightPairing: Sendable {
     public init(
         paths: Paths, runner: any CommandRunner, agent: HostAgentClient,
         makePIN: @escaping @Sendable () -> String = MoonlightPairing.randomPIN,
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        sleep: @escaping @Sendable (Duration) async throws -> Void = systemSleep
     ) {
         self.paths = paths
         self.runner = runner

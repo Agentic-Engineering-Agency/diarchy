@@ -69,7 +69,7 @@ public actor ModeController {
 
     public init(
         paths: Paths, runner: any CommandRunner, agent: HostAgentClient,
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        sleep: @escaping @Sendable (Duration) async throws -> Void = systemSleep,
         isExecutable: @escaping @Sendable (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) },
         now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now },
         onChange: @escaping @Sendable (ModeSnapshot) -> Void = { _ in },
