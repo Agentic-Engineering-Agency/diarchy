@@ -14,11 +14,11 @@ prints the command and you run it ([ADR 0002](adr/0002-no-sudo-required-actions.
 
 ## a. Download the release (recommended)
 
-1. Download the release files from <https://github.com/Sebastiangmz/diarchy/releases>. Use the browser, or the GitHub CLI:
+1. Download the release files from <https://github.com/Agentic-Engineering-Agency/diarchy/releases>. Use the browser, or the GitHub CLI:
 
    ```sh
    cd ~/Downloads
-   gh release download v0.1.0-beta.1 --repo Sebastiangmz/diarchy --pattern 'Diarchy-*.zip' --pattern SHA256SUMS
+   gh release download v0.1.0-beta.1 --repo Agentic-Engineering-Agency/diarchy --pattern 'Diarchy-*.zip' --pattern SHA256SUMS
    ```
 
 2. Check the SHA-256 sum. Run it in the folder that holds both files. Each line must say `OK`.
@@ -56,7 +56,7 @@ Known limitation: the app can run from an App Translocation path if you moved it
 Requirements: Xcode or the Swift 6 toolchain, and the macOS command line tools.
 
 ```sh
-git clone https://github.com/Sebastiangmz/diarchy.git
+git clone https://github.com/Agentic-Engineering-Agency/diarchy.git
 cd diarchy
 app/scripts/build-app.sh
 ```
@@ -83,7 +83,7 @@ The app does these steps for you in the setup checklist. This section shows them
 4. Install the host agent. On the host, from a clone of this repository:
 
    ```sh
-   git clone https://github.com/Sebastiangmz/diarchy.git
+   git clone https://github.com/Agentic-Engineering-Agency/diarchy.git
    bash diarchy/host/install-host.sh --with-streaming
    ```
 
@@ -125,5 +125,5 @@ Diarchy works on a LAN. Tailscale adds a route that works from another network.
 ## Next
 
 - Uninstall: [uninstall.md](uninstall.md).
-- Something does not work? Open a [bug report](https://github.com/Sebastiangmz/diarchy/issues/new?template=bug.yml).
-- It works? Send a [hardware report](https://github.com/Sebastiangmz/diarchy/issues/new?template=hardware-report.yml).
+- Something does not work? Open a [bug report](https://github.com/Agentic-Engineering-Agency/diarchy/issues/new?template=bug.yml).
+- It works? Send a [hardware report](https://github.com/Agentic-Engineering-Agency/diarchy/issues/new?template=hardware-report.yml).

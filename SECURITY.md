@@ -4,7 +4,7 @@ Diarchy is in public beta (`0.1.0-beta.1`). Only the latest release gets securit
 
 ## Report a vulnerability
 
-Use GitHub private reporting: <https://github.com/Sebastiangmz/diarchy/security/advisories/new>
+Use GitHub private reporting: <https://github.com/Agentic-Engineering-Agency/diarchy/security/advisories/new>
 
 Do not open a public issue for a vulnerability. Do not post secrets, IP addresses, host names or SSH keys in a report.
 

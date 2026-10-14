@@ -13,7 +13,7 @@ It takes about 3 minutes.
    `Mac model identifier`, `Chip`, `macOS version`, `Moonlight version`, `Lan Mouse version`, `Tailscale installed`,
    `Route used (lan/tailscale/none)`, and the host report as a `json` block.
 3. Read the text. Remove any IP address, name or host name that is still in it.
-4. Open a [hardware report](https://github.com/Sebastiangmz/diarchy/issues/new?template=hardware-report.yml),
+4. Open a [hardware report](https://github.com/Agentic-Engineering-Agency/diarchy/issues/new?template=hardware-report.yml),
    paste the text, and fill in what worked.
 
 The compatibility matrix is in [docs/compat/matrix.yml](docs/compat/matrix.yml). The fields are in
@@ -22,7 +22,7 @@ The compatibility matrix is in [docs/compat/matrix.yml](docs/compat/matrix.yml).
 ## 2. Report a bug
 
 1. Search the existing issues first.
-2. Open a [bug report](https://github.com/Sebastiangmz/diarchy/issues/new?template=bug.yml).
+2. Open a [bug report](https://github.com/Agentic-Engineering-Agency/diarchy/issues/new?template=bug.yml).
 3. One machine per report. Say if it is a regression and since which version.
 4. Never paste IP addresses, SSIDs, host names, SSH keys, Sunshine credentials or tokens.
 

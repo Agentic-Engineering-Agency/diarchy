@@ -51,7 +51,7 @@ never runs commands as root. When a step needs root, it shows the command for yo
 The app is ad-hoc signed and not notarized. There is no paid Apple Developer account behind it. macOS will warn you
 the first time you open it.
 
-1. Download the latest zip and `SHA256SUMS` from the [Releases](https://github.com/Sebastiangmz/diarchy/releases) page.
+1. Download the latest zip and `SHA256SUMS` from the [Releases](https://github.com/Agentic-Engineering-Agency/diarchy/releases) page.
 2. Check the file: `shasum -a 256 -c SHA256SUMS`.
 3. Open the zip in Finder. Drag `Diarchy.app` to the Applications folder in Finder.
 4. Open `Diarchy.app`. macOS refuses the first time. Open System Settings > Privacy & Security, find the message

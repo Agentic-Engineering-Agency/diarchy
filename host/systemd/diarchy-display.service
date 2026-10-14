@@ -1,6 +1,6 @@
 [Unit]
 Description=Maintain a capturable Hyprland output for Diarchy
-Documentation=https://github.com/Sebastiangmz/diarchy
+Documentation=https://github.com/Agentic-Engineering-Agency/diarchy
 After=graphical-session.target
 PartOf=graphical-session.target
 
