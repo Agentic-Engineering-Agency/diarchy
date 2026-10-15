@@ -122,6 +122,22 @@ Diarchy works on a LAN. Tailscale adds a route that works from another network.
 3. On a host with `ufw`, allow Lan Mouse on the Tailscale interface. The probe prints the exact command.
    It opens UDP port 4242 to every device in your tailnet. Lan Mouse still needs the paired certificate.
 
+## Find your stream output name
+
+Streaming needs the Hyprland monitor name of the display you want to share.
+
+1. On the host, list monitors:
+
+   ```sh
+   hyprctl monitors
+   ```
+
+   The output shows names such as `eDP-1` (laptop panel) and `DP-1` (external display). Use the `name` field, not a make/model string.
+
+2. In the Diarchy app, open Settings, then the Streaming tab. Set **Stream Output** to that monitor name.
+
+3. Leave **Stream Output** as `auto` if you want Diarchy to pick a display for you. Prefer an explicit name when the host has more than one monitor.
+
 ## Next
 
 - Uninstall: [uninstall.md](uninstall.md).
