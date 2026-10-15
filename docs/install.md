@@ -124,19 +124,22 @@ Diarchy works on a LAN. Tailscale adds a route that works from another network.
 
 ## Find your stream output name
 
-Streaming needs the Hyprland monitor name of the display you want to share.
+Streaming captures one Hyprland monitor. Diarchy calls it the stream output.
 
-1. On the host, list monitors:
+1. In the Diarchy app, open Settings, then the Streaming tab. The **Stream Output** list shows **Automatic** and the
+   monitors that the host reports. Pick one.
+
+2. To see the monitor names on the host yourself, run:
 
    ```sh
-   hyprctl monitors
+   hyprctl -j monitors | jq -r '.[].name'
    ```
 
-   The output shows names such as `eDP-1` (laptop panel) and `DP-1` (external display). Use the `name` field, not a make/model string.
+   The names look like `eDP-1` (laptop panel) and `DP-1` (external display). A name is not the make or the model.
 
-2. In the Diarchy app, open Settings, then the Streaming tab. Set **Stream Output** to that monitor name.
-
-3. Leave **Stream Output** as `auto` if you want Diarchy to pick a display for you. Prefer an explicit name when the host has more than one monitor.
+3. **Automatic** picks the first match in this order: the enabled internal panel, the focused monitor, the first
+   enabled monitor. If no monitor is enabled, Diarchy uses a virtual output named `DIARCHY`. Pick a name yourself
+   when the host has more than one monitor and you want a specific one.
 
 ## Next
 
